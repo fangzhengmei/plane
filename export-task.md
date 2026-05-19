@@ -1100,5 +1100,320 @@ const payload = {
 | 6 | `views/exporter/base.py:49-56` | `issue_export_task.delay()` 增加 `rich_filters` 参数 |
 | 7 | `bgtasks/export_task.py:128-135, 148-155` | 接收 `rich_filters` 参数并应用到查询条件 |
 
+---
+
+## 十八、时间线与误差上界可复算公式
+
+### 18.1 三个时间基准的精确定义
+
+| 符号 | 定义 | 来源 | 精度 |
+|-----|------|------|------|
+| **T<sub>C</sub>** | 任务创建时间 | `ExporterHistory.created_at` | 毫秒级 |
+| **T<sub>U</sub>** | 预签名 URL 生成时间 | `upload_to_s3()` 执行时的 `timezone.now()` | 秒级 |
+| **T<sub>N</sub>** | 当前时间 | 客户端 `new Date()` 或服务端 `timezone.now()` | 毫秒级 |
+| **ΔT** | 任务执行耗时 | T<sub>U</sub> - T<sub>C</sub> | 秒级 |
+
+### 18.2 各阶段过期计算公式
+
+| 计算方 | 过期判定公式 | 精度 |
+|-------|-------------|------|
+| **S3 真实过期** | T<sub>S3_expire</sub> = T<sub>U</sub> + 7 × 86400 秒 | 秒级 |
+| **前端判定过期** | T<sub>FE_expire</sub> = getDate(T<sub>C</sub>) + 7天 00:00:00 本地时间 | 日级 |
+| **后台清理阈值** | 满足 `created_at <= timezone.now() - timedelta(days=8)` 时触发清理（等价于 T<sub>N</sub> - T<sub>C</sub> >= 8天） | 秒级 |
+
+### 18.3 getDate() 截断误差公式
+
+设 T<sub>C</sub> = YYYY-MM-DDTHH:MM:SS.mmmZ（UTC 时间）
+
+```
+getDate(T_C) = new Date(YYYY, MM-1, DD)  // 本地时区，时间固定为 00:00:00
+
+截断误差 E_trunc = T_C 当天已过时间 = HH小时 + MM分钟 + SS秒 + mmm毫秒
+                = (T_C.getUTCHours() * 3600 + T_C.getUTCMinutes() * 60 + T_C.getUTCSeconds() + T_C.getUTCMilliseconds()/1000) 秒
+```
+
+**误差范围**: 0 ≤ E<sub>trunc</sub> < 86400 秒（0 ~ 24小时）
+
+**最大误差场景**: T<sub>C</sub> = YYYY-MM-DDT23:59:59.999Z，E<sub>trunc</sub> = 86399.999 秒 ≈ 24小时
+
+### 18.4 前端提前显示过期的时间量
+
+```
+前端提前量 = T_S3_expire - T_FE_expire
+           = (T_U + 7*86400) - (getDate(T_C) + 7*86400)
+           = T_U - getDate(T_C)
+           = (T_C + ΔT) - getDate(T_C)
+           = (T_C - getDate(T_C)) + ΔT
+           = E_trunc + ΔT
+```
+
+**最终公式**:
+```
+前端提前显示过期的时间 = 日级截断误差 + 任务执行耗时
+                      = E_trunc + ΔT
+```
+
+### 18.5 不同场景下的误差量化
+
+| 场景 | T<sub>C</sub> (UTC) | ΔT (任务耗时) | E<sub>trunc</sub> | 前端提前量 |
+|-----|-------------------|--------------|------------------|-----------|
+| 上午创建 | 2026-05-19T10:00:00Z | 30秒 | 10小时 | 10小时0分30秒 |
+| 下午创建 | 2026-05-19T14:30:00Z | 2分钟 | 14.5小时 | 14小时32分钟 |
+| 深夜创建 | 2026-05-19T23:00:00Z | 3小时 | 23小时 | 26小时 |
+| 午夜临界 | 2026-05-19T23:59:59Z | 1小时 | ~24小时 | ~25小时 |
+
+**最坏情况上界**: 前端可能提前约 **25~26小时** 显示过期（深夜创建 + 任务执行1~2小时）。
+
+### 18.6 时区影响分析
+
+前端 `getDate()` 使用**本地时区**解析日期：
+
+| 用户时区 | T<sub>C</sub> (UTC) | getDate() 解析结果 | E<sub>trunc</sub> |
+|---------|-------------------|-------------------|------------------|
+| UTC+0 | 2026-05-19T23:00:00Z | 2026-05-19T00:00:00Z | 23小时 |
+| UTC+8 | 2026-05-19T23:00:00Z | 2026-05-20T00:00:00+08:00 = 2026-05-19T16:00:00Z | 7小时 |
+| UTC-5 | 2026-05-19T23:00:00Z | 2026-05-19T00:00:00-05:00 = 2026-05-19T05:00:00Z | 18小时 |
+
+**时区修正公式**:
+```
+E_trunc_with_tz = (T_C - getDate(T_C).toUTC()) 
+                = E_trunc_utc ± timezone_offset
+```
+
+东八区用户的截断误差比 UTC 用户小约 8 小时。
+
+---
+
+## 十九、分页与新任务可见性分析
+
+### 19.1 分页实现原理
+
+**后端分页器**: `OffsetPaginator` (`apps/api/plane/utils/paginator.py:93-188`)
+
+```python
+def paginate(self, request, ...):
+    # 1. 解析 cursor: "limit:offset:is_prev"
+    input_cursor = Cursor.from_string(request.GET.get("cursor", f"{per_page}:0:0"))
+    
+    # 2. 默认排序: -created_at（最新在前）
+    queryset = queryset.order_by(
+        (F(*self.key).desc(nulls_last=True) if self.desc else F(*self.key).asc(nulls_last=True)),
+        "-created_at",
+    )
+    
+    # 3. 计算偏移: offset = cursor.offset * limit
+    page = cursor.offset  # 页码，从 0 开始
+    offset = cursor.offset * limit
+    stop = offset + limit + 1
+    
+    # 4. 切片查询
+    results = queryset[offset:stop]
+```
+
+**前端分页参数**: `apps/web/core/components/exporter/guide.tsx` + `apps/web/core/components/exporter/prev-exports.tsx`
+```typescript
+const per_page = 10;
+const [cursor, setCursor] = useState<string | undefined>("10:0:0");  // 第一页 cursor
+```
+
+### 19.2 新任务不可见的场景
+
+**场景复现**:
+```
+1. 导出历史共有 25 条记录（按 -created_at 排序）
+2. 用户浏览到第 2 页（offset=10, limit=10）
+   - 第1页: 记录 0-9 (最新10条)
+   - 第2页: 记录 10-19
+   - 第3页: 记录 20-24
+
+3. 用户在第 2 页发起新导出
+4. 新任务创建成功（T_C = now）
+5. 由于排序是 -created_at，新任务插入到列表最前面（位置0）
+6. 原记录 0-9 被挤到位置 1-10
+7. 原记录 10-19 被挤到位置 11-20
+8. 当前页（第2页，offset=10）现在显示原记录 10-19 → 变成原记录 11-20
+9. 新任务在位置 0，属于第 1 页，不在当前页可见范围内！
+```
+
+**结论**: 当用户不在第1页时发起新导出，新任务会出现在第1页，当前页看不到。
+
+### 19.3 自动轮询触发条件回顾
+
+**文件**: `prev-exports.tsx:54-64`
+
+```typescript
+useEffect(() => {
+  const interval = setInterval(() => {
+    if (exporterServices?.results?.some((service) => service.status === "processing")) {
+      handleRefresh();  // 只刷新当前页数据
+    } else {
+      clearInterval(interval);
+    }
+  }, 3000);
+}, [exporterServices]);
+```
+
+**关键点**:
+1. 轮询只检查 `processing` 状态，不检查 `queued` 状态
+2. 轮询刷新的是**当前页**的数据（通过 SWR mutate 刷新当前 URL）
+3. 新任务如果在其他页，轮询刷新当前页也看不到
+
+### 19.4 可见性矩阵
+
+| 用户所在页 | 新任务状态 | 是否可见 | 原因 |
+|-----------|-----------|---------|------|
+| 第 1 页 | queued | ✅ 可见 | 新任务在第1页 |
+| 第 1 页 | processing | ✅ 可见+轮询 | 触发自动轮询 |
+| 第 2+ 页 | queued | ❌ 不可见 | 新任务在第1页，当前页看不到 |
+| 第 2+ 页 | processing | ⚠️ 部分可见 | 新任务在第1页，轮询刷新当前页没用 |
+| 第 2+ 页 | completed | ❌ 不可见 | 新任务在第1页 |
+
+### 19.5 体验影响
+
+```
+用户场景:
+1. 导出历史有30条，用户翻到第3页看历史记录
+2. 想起要导出当前筛选的数据，点击导出
+3. 看到成功提示，等待导出完成
+4. 当前页显示的还是老的第3页记录，看不到新任务
+5. 用户以为导出没成功，可能重复点击
+6. 只有手动回到第1页才能看到新任务
+```
+
+**修复建议**: 导出成功后自动跳转到第1页（设置 `cursor="10:0:0"` 并触发该 key 的 mutate）。
+
+---
+
+## 二十、失败原因字段回流链路追踪
+
+### 20.1 完整链路图
+
+```
+后台任务执行失败
+    ↓
+export_task.py:220-225
+    exporter_instance.status = "failed"
+    exporter_instance.reason = str(e)  ✅ 已写入数据库
+    exporter_instance.save(update_fields=["status", "reason"])
+    ↓
+数据库表 exporters
+    status: "failed"
+    reason: "具体错误信息"  ✅ 已持久化
+    ↓
+GET /export-issues/ API 调用
+    ↓
+views/exporter/base.py:68-79
+    queryset = ExporterHistory.objects.filter(...)
+    ExporterHistorySerializer(queryset, many=True).data  ⚠️ 序列化器过滤
+    ↓
+ExporterHistorySerializer
+    class Meta:
+        fields = [
+            "id", "created_at", ..., "status", "url", ...
+            // ❌ reason 字段未包含在 fields 列表中！
+        ]
+    ↓
+API 返回 JSON
+    {
+      "id": "...",
+      "status": "failed",
+      // ❌ reason 字段丢失！
+      "url": null,
+      ...
+    }
+    ↓
+前端 IExportData 类型
+    export interface IExportData {
+      id: string;
+      status: string;
+      url: string;
+      // ❌ reason 字段未定义！
+    }
+    ↓
+前端展示
+    红色 "failed" 状态
+    无错误原因展示  ❌ 用户不知道为什么失败
+```
+
+### 20.2 断点确认
+
+**断点位置**: `apps/api/plane/app/serializers/exporter.py:16-29`
+
+**根因**: `ExporterHistorySerializer.Meta.fields` 列表中**缺少 `"reason"` 字段**。
+
+```python
+# 当前 fields 列表
+fields = [
+    "id",
+    "created_at",
+    "updated_at",
+    "project",
+    "provider",
+    "status",
+    "url",
+    "initiated_by",
+    "initiated_by_detail",
+    "token",
+    "created_by",
+    "updated_by",
+    // 缺少 "reason" 字段！
+]
+```
+
+### 20.3 后端写入验证
+
+**后台任务写入失败原因的两处代码**:
+
+1. **格式错误异常** (`export_task.py:195-201`):
+```python
+except ValueError as e:
+    exporter_instance = ExporterHistory.objects.get(token=token_id)
+    exporter_instance.status = "failed"
+    exporter_instance.reason = str(e)  // 写入 reason
+    exporter_instance.save(update_fields=["status", "reason"])
+```
+
+2. **通用异常捕获** (`export_task.py:220-225`):
+```python
+except Exception as e:
+    exporter_instance = ExporterHistory.objects.get(token=token_id)
+    exporter_instance.status = "failed"
+    exporter_instance.reason = str(e)  // 写入 reason
+    exporter_instance.save(update_fields=["status", "reason"])
+```
+
+**结论**: 后台已经完整写入 `reason` 字段，问题出在序列化层。
+
+### 20.4 排障可观测性影响
+
+| 角色 | 影响 |
+|-----|------|
+| **终端用户** | ❌ 看到红色 "failed" 但不知道为什么失败，无法自助排查 |
+| **开发人员** | ❌ 无法通过 API 返回快速定位问题，必须登录服务器查日志 |
+| **支持团队** | ❌ 无法根据用户截图判断问题类型，需要额外沟通 |
+| **系统监控** | ⚠️ 数据库中有 reason 但 API 不暴露，无法基于 API 响应做告警 |
+
+### 20.5 修复清单
+
+要让失败原因展示在前端，需要完成 **3 处修改**：
+
+| 序号 | 文件 | 修改内容 |
+|-----|------|---------|
+| 1 | `serializers/exporter.py:16-29` | 在 `fields` 列表中添加 `"reason"` |
+| 2 | `packages/types/src/importer/index.ts:42-54` | 在 `IExportData` 接口中添加 `reason: string;` |
+| 3 | `web/core/components/exporter/column.tsx` | 新增一列展示失败原因（或 tooltip 悬浮显示） |
+
+### 20.6 典型失败原因示例
+
+| 失败场景 | reason 字段内容 |
+|---------|----------------|
+| 无效格式 | `"Invalid format type: invalid_format. Must be one of: csv, json, xlsx"` |
+| 数据库连接 | `"could not connect to server: Connection refused"` |
+| 权限错误 | `"You do not have permission to perform this action."` |
+| 内存不足 | `"Exception: RuntimeError: memory allocation failed"` |
+| S3 上传失败 | `"ClientError: An error occurred (AccessDenied) when calling the PutObject operation"` |
+
+这些信息目前全部被序列化器过滤掉了。
+
 
 
