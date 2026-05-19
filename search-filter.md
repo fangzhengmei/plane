@@ -2,24 +2,39 @@
 
 ## 一、整体架构概览
 
-搜索过滤系统采用**分层设计**，从前端用户交互到后端数据库查询，经过多层转换和组合：
+搜索过滤系统采用**分层设计**，从前端用户交互到后端数据库查询，经过多层转换和组合，最终形成多维度约束叠加的完整查询：
 
 ```
-用户交互（UI选择过滤条件）
-    ↓
-前端状态管理（FilterInstance）
-    ↓
-内部表达式树（TFilterExpression）
-    ↓
-Adapter转换（toExternal）
-    ↓
-外部格式（field__operator: value, AND/OR组合）
-    ↓
-后端ComplexFilterBackend
-    ↓
-Django Q对象组合
-    ↓
-数据库查询（QuerySet.filter）
+┌─────────────────────────────────────────────────────────────────┐
+│                        前端请求发起链路                           │
+├─────────────────────────────────────────────────────────────────┤
+│  用户交互（UI选择过滤条件）                                       │
+│      ↓                                                          │
+│  FilterInstance 状态管理（表达式树构建）                           │
+│      ↓                                                          │
+│  Adapter.toExternal() → TWorkItemFilterExpression                │
+│      ↓                                                          │
+│  computedFilteredParams() → JSON.stringify(richFilters)          │
+│      ↓                                                          │
+│  IssueService.getIssues() → URL参数: ?filters={...}&...         │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                        后端查询拼装链路                           │
+├─────────────────────────────────────────────────────────────────┤
+│  接收请求: request.query_params.get("filters")                   │
+│      ↓                                                          │
+│  ComplexFilterBackend → 解析JSON → 构建Q对象(rich filters)        │
+│      ↓                                                          │
+│  issue_filters() → 解析旧版扁平参数 → 构建过滤字典                │
+│      ↓                                                          │
+│  权限约束检查: 访客用户/项目成员角色过滤                          │
+│      ↓                                                          │
+│  多维度叠加: QuerySet.filter(rich_q).filter(**legacy_filters)    │
+│                    .filter(permission_q)                         │
+│      ↓                                                          │
+│  数据库查询执行                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -186,9 +201,331 @@ private _createWorkItemFilterConditionData = (property, operator, value) => {
 
 ---
 
-## 五、后端查询拼装
+## 五、前端请求序列化与查询触发
 
-### 5.1 ComplexFilterBackend
+### 5.1 过滤器参数构建
+
+定义位置：`apps/web/core/store/issue/helpers/issue-filter-helper.store.ts`
+
+当用户选择过滤条件后，前端需要将内部表达式树转换为URL查询参数。核心函数是 `computedFilteredParams`：
+
+```typescript
+computedFilteredParams = (
+  richFilters: TWorkItemFilterExpression,    // Adapter转换后的外部格式
+  displayFilters: IIssueDisplayFilterOptions | undefined,
+  acceptableParamsByLayout: TIssueParams[]
+): Partial<Record<TIssueParams, string | boolean>> => {
+  // 1. 构建显示过滤参数（分组、排序等）
+  const computedDisplayFilters = {
+    group_by: displayFilters?.group_by ? EIssueGroupByToServerOptions[displayFilters.group_by] : undefined,
+    order_by: displayFilters?.order_by || undefined,
+    sub_issue: displayFilters?.sub_issue ?? true,
+  };
+
+  const issueFiltersParams: Partial<Record<TIssueParams, boolean | string>> = {};
+
+  // 2. 转换为字符串参数，数组用逗号连接
+  Object.keys(computedDisplayFilters).forEach((key) => {
+    const _key = key as TIssueParams;
+    const _value = computedDisplayFilters[_key];
+    if (_value != undefined && acceptableParamsByLayout.includes(_key))
+      issueFiltersParams[_key] = Array.isArray(_value)
+        ? _value.join(",")
+        : _value;
+  });
+
+  // 3. 关键：富过滤器JSON序列化
+  if (richFilters) 
+    issueFiltersParams.filters = JSON.stringify(richFilters);
+
+  // 4. 附加其他参数
+  if (displayFilters?.layout) 
+    issueFiltersParams.layout = displayFilters?.layout;
+
+  return issueFiltersParams;
+};
+```
+
+**序列化关键点**：
+- 富过滤器使用 `JSON.stringify()` 序列化为JSON字符串
+- 多值参数使用逗号分隔的字符串（如 `priority=high,urgent`）
+- 布尔值和简单值直接转换为字符串
+
+### 5.2 查询触发流程
+
+定义位置：`apps/web/core/store/issue/project/issue.store.ts`
+
+```typescript
+fetchIssues = async (
+  workspaceSlug: string,
+  projectId: string,
+  loadType: TLoader = "init-loader",
+  options: IssuePaginationOptions
+) => {
+  try {
+    // 设置加载状态
+    runInAction(() => {
+      this.setLoader(loadType);
+      this.clear(!isExistingPaginationOptions);
+    });
+
+    // 1. 从FilterStore获取构建好的查询参数
+    const params = this.issueFilterStore?.getFilterParams(
+      options, 
+      projectId, 
+      undefined, 
+      undefined, 
+      undefined
+    );
+
+    // 2. 调用IssueService发送请求
+    const response = await this.issueService.getIssues(
+      workspaceSlug, 
+      projectId, 
+      params, 
+      { signal: this.controller.signal }
+    );
+
+    // 3. 处理响应
+    this.onfetchIssues(response, options, workspaceSlug, projectId);
+    return response;
+  } catch (error) {
+    this.setLoader(undefined);
+    throw error;
+  }
+};
+```
+
+### 5.3 最终URL示例
+
+假设用户选择了：
+- 状态：待办（state_id = backlog-uuid）
+- 优先级：高或紧急（priority in [high, urgent]）
+- 分组方式：按状态分组
+- 每页数量：25
+
+生成的URL查询参数：
+```
+?filters={"and":[{"state_id__exact":"backlog-uuid"},{"priority__in":"high,urgent"}]}
+&group_by=state
+&order_by=-created_at
+&per_page=25
+&cursor=25:0:0
+```
+
+---
+
+## 六、后端多维度过滤叠加
+
+### 6.1 视图层过滤管线
+
+定义位置：`apps/api/plane/app/views/issue/base.py`
+
+后端查询构建采用**分层过滤管线**设计，多种过滤维度依次叠加：
+
+```python
+class IssueViewSet(BaseViewSet):
+    filter_backends = (ComplexFilterBackend,)  # 富过滤器后端
+    filterset_class = IssueFilterSet           # 字段白名单与Q对象构建
+
+    def list(self, request, slug, project_id):
+        # ========== 基础查询 ==========
+        issue_queryset = self.get_queryset()  # 基础: workspace+project过滤
+
+        # ========== 维度1: 富过滤器 (ComplexFilterBackend) ==========
+        # 解析 ?filters=... 参数，构建Q对象
+        issue_queryset = self.filter_queryset(issue_queryset)
+
+        # ========== 维度2: 旧版扁平过滤器 ==========
+        # 解析 ?state=...&priority=... 等参数
+        filters = issue_filters(query_params, "GET")
+        issue_queryset = issue_queryset.filter(**filters)
+
+        # ========== 维度3: 权限约束 ==========
+        # 访客用户只能查看自己创建的issue
+        project = Project.objects.get(pk=project_id, workspace__slug=slug)
+        if (
+            ProjectMember.objects.filter(
+                workspace__slug=slug,
+                project_id=project_id,
+                member=request.user,
+                role=5,  # GUEST角色
+                is_active=True,
+            ).exists()
+            and not project.guest_view_all_features
+        ):
+            issue_queryset = issue_queryset.filter(created_by=request.user)
+
+        # ========== 维度4: 其他特殊过滤 ==========
+        # 分组、分页、排序等后续处理
+        # ...
+```
+
+### 6.2 过滤器后端执行机制
+
+定义位置：`apps/api/plane/api/views/base.py`
+
+```python
+class BaseAPIView(GenericAPIView):
+    def filter_queryset(self, queryset):
+        """遍历所有filter_backends，依次应用过滤"""
+        for backend in list(self.filter_backends):
+            queryset = backend().filter_queryset(self.request, queryset, self)
+        return queryset
+```
+
+这是标准的 DRF FilterBackend 机制，支持多个后端串联执行。当前配置：
+```python
+filter_backends = (ComplexFilterBackend,)  # 仅使用富过滤器
+```
+
+### 6.3 旧版过滤器（issue_filters）
+
+定义位置：`apps/api/plane/utils/issue_filters.py`
+
+这是系统演进过程中保留的扁平参数过滤机制，与富过滤器并行工作：
+
+```python
+def issue_filters(query_params, method, prefix=""):
+    issue_filter = {}
+
+    # 支持的过滤字段映射表
+    ISSUE_FILTER = {
+        "state": filter_state,           # 状态过滤
+        "state_group": filter_state_group,  # 状态组过滤
+        "priority": filter_priority,     # 优先级过滤
+        "assignees": filter_assignees,   # 处理人过滤
+        "labels": filter_labels,         # 标签过滤
+        "created_by": filter_created_by, # 创建人过滤
+        "cycle": filter_cycle,           # 迭代过滤
+        "module": filter_module,         # 模块过滤
+        "start_date": filter_start_date, # 开始日期
+        "target_date": filter_target_date, # 截止日期
+        "sub_issue": filter_sub_issue_toggle, # 子issue开关
+        # ... 共20+种过滤字段
+    }
+
+    # 遍历查询参数，匹配到的字段调用对应的过滤函数
+    for key, value in ISSUE_FILTER.items():
+        if key in query_params:
+            func = value
+            func(query_params, issue_filter, method, prefix)
+    
+    return issue_filter
+```
+
+**典型过滤函数实现**：
+```python
+def filter_assignees(params, issue_filter, method, prefix=""):
+    if method == "GET":
+        # GET请求：逗号分隔字符串 → 数组
+        assignees = [item for item in params.get("assignees").split(",") if item != "null"]
+        if "None" in assignees:
+            issue_filter[f"{prefix}assignees__isnull"] = True
+        assignees = filter_valid_uuids(assignees)
+        if len(assignees):
+            issue_filter[f"{prefix}assignees__in"] = assignees
+    
+    # 自动添加软删除排除条件
+    issue_filter[f"{prefix}issue_assignee__deleted_at__isnull"] = True
+    return issue_filter
+```
+
+### 6.4 权限约束机制
+
+权限过滤是在业务逻辑层直接添加的硬约束，确保数据安全：
+
+```python
+# 在 IssueViewSet.list 中
+if (
+    # 用户是访客角色
+    ProjectMember.objects.filter(
+        workspace__slug=slug,
+        project_id=project_id,
+        member=request.user,
+        role=5,  # GUEST
+        is_active=True,
+    ).exists()
+    # 项目未开启"访客查看所有内容"
+    and not project.guest_view_all_features
+):
+    # 强制过滤：只能查看自己创建的issue
+    issue_queryset = issue_queryset.filter(created_by=request.user)
+```
+
+在 `IssueDetailEndpoint` 中权限检查更复杂，使用子查询实现：
+```python
+permission_subquery = (
+    Issue.issue_objects.filter(workspace__slug=slug, project_id=project_id, id=OuterRef("id"))
+    .filter(
+        # 管理员/成员：查看所有
+        Q(
+            project__project_projectmember__member=self.request.user,
+            project__project_projectmember__is_active=True,
+            project__project_projectmember__role__gt=ROLE.GUEST.value,
+        )
+        # 访客 + 开启查看所有：查看所有
+        | Q(
+            project__project_projectmember__member=self.request.user,
+            project__project_projectmember__is_active=True,
+            project__project_projectmember__role=ROLE.GUEST.value,
+            project__guest_view_all_features=True,
+        )
+        # 访客 + 未开启查看所有：仅查看自己创建
+        | Q(
+            project__project_projectmember__member=self.request.user,
+            project__project_projectmember__is_active=True,
+            project__project_projectmember__role=ROLE.GUEST.value,
+            project__guest_view_all_features=False,
+            created_by=self.request.user,
+        )
+    )
+    .values("id")
+)
+
+# 使用 EXISTS 子查询进行权限过滤
+issue = Issue.issue_objects.filter(Exists(permission_subquery))
+```
+
+### 6.5 完整过滤叠加顺序
+
+最终的查询构建遵循严格的叠加顺序，确保安全性和正确性：
+
+| 顺序 | 过滤维度 | 实现方式 | 说明 |
+|------|---------|---------|------|
+| 1 | 基础范围 | `get_queryset()` | 限定工作区、项目、删除状态 |
+| 2 | 富过滤器 | `ComplexFilterBackend` | 解析 `?filters=` JSON参数 |
+| 3 | 旧版过滤器 | `issue_filters()` | 解析扁平查询参数 |
+| 4 | 权限约束 | 业务逻辑层 | 访客/成员角色过滤 |
+| 5 | 分组/排序 | 后续处理 | `order_by`, `group_by` 等 |
+
+**最终生成的SQL伪代码**：
+```sql
+SELECT * FROM issue
+WHERE 
+  -- 基础范围
+  workspace_id = 'xxx' 
+  AND project_id = 'yyy'
+  AND deleted_at IS NULL
+  
+  -- 富过滤器 (AND组合)
+  AND (state_id = 'backlog-uuid' AND priority IN ('high', 'urgent'))
+  
+  -- 旧版过滤器 (如果有)
+  AND created_by_id IN ('user1', 'user2')
+  
+  -- 权限约束 (访客用户)
+  AND created_by_id = 'current-user-id'
+  
+ORDER BY created_at DESC
+LIMIT 25 OFFSET 0;
+```
+
+---
+
+## 七、后端查询拼装（ComplexFilterBackend）
+
+### 7.1 ComplexFilterBackend
 
 定义位置：`apps/api/plane/utils/filters/filter_backend.py`
 
@@ -198,7 +535,7 @@ private _createWorkItemFilterConditionData = (property, operator, value) => {
 3. 递归构建 Django Q 对象
 4. 应用到 QuerySet
 
-#### 5.1.1 处理流程
+#### 7.1.1 处理流程
 
 ```python
 def filter_queryset(self, request, queryset, view):
@@ -219,7 +556,7 @@ def filter_queryset(self, request, queryset, view):
     return queryset.filter(combined_q)
 ```
 
-#### 5.1.2 节点求值（_evaluate_node）
+#### 7.1.2 节点求值（_evaluate_node）
 
 这是核心的递归组合逻辑：
 
@@ -255,11 +592,11 @@ def _evaluate_node(self, node, view, queryset):
 - 使用 Django Q 对象进行惰性求值，最后一次性应用
 - 逻辑运算符与字段条件完全分离
 
-### 5.2 FilterSet 与 Q 对象构建
+### 7.2 FilterSet 与 Q 对象构建
 
 定义位置：`apps/api/plane/utils/filters/filterset.py`
 
-#### 5.2.1 BaseFilterSet.build_combined_q
+#### 7.2.1 BaseFilterSet.build_combined_q
 
 ```python
 def build_combined_q(self):
@@ -286,7 +623,7 @@ def build_combined_q(self):
     return combined_q
 ```
 
-#### 5.2.2 IssueFilterSet 示例
+#### 7.2.2 IssueFilterSet 示例
 
 ```python
 class IssueFilterSet(BaseFilterSet):
@@ -313,7 +650,7 @@ class IssueFilterSet(BaseFilterSet):
 
 ---
 
-## 六、完整链路示例
+## 八、完整链路示例
 
 ### 场景：用户在UI选择"状态为待办 且 优先级为高或紧急"
 
@@ -377,53 +714,53 @@ queryset = Issue.objects.filter(
 
 ---
 
-## 七、关键设计决策
+## 九、关键设计决策
 
-### 7.1 为什么使用表达式树而不是扁平字典？
+### 9.1 为什么使用表达式树而不是扁平字典？
 - 支持复杂的逻辑组合（AND/OR/NOT嵌套）
 - 每个条件有唯一标识，便于精确更新/删除
 - 类型安全，结构清晰
 
-### 7.2 为什么需要 Adapter 层？
+### 9.2 为什么需要 Adapter 层？
 - **解耦**：前端内部结构与后端API格式独立演化
 - **兼容**：支持不同业务场景的外部格式（工作项、自动化等）
 - **转换**：处理多值逗号分隔、特殊字段映射等
 
-### 7.3 后端为什么使用 Q 对象组合？
+### 9.3 后端为什么使用 Q 对象组合？
 - **性能**：所有条件一次性生成 SQL，避免多次查询
 - **灵活**：支持任意复杂的逻辑组合
 - **安全**：通过 FilterSet 白名单验证，防止SQL注入
 
-### 7.4 自定义过滤方法 vs 标准过滤
+### 9.4 自定义过滤方法 vs 标准过滤
 - **标准过滤**：直接映射数据库字段，性能最优
 - **自定义方法**：处理软删除、权限、复杂业务逻辑
 - 统一返回 Q 对象，保持组合逻辑一致
 
 ---
 
-## 八、常见问题排查
+## 十、常见问题排查
 
-### 8.1 过滤条件不生效？
+### 10.1 过滤条件不生效？
 1. 检查前端 `expression` 是否正确构建
 2. 检查 `toExternal` 转换后的格式是否正确
 3. 检查后端 `filters` 参数是否正确接收
 4. 查看 FilterSet 中是否声明了该字段
 
-### 8.2 多值条件只匹配第一个？
+### 10.2 多值条件只匹配第一个？
 - 确认操作符是 `__in` 而不是 `__exact`
 - 检查逗号分隔是否正确解析（`_parseFilterValue`）
 
-### 8.3 关联表过滤结果重复？
+### 10.3 关联表过滤结果重复？
 - 检查是否需要 `.distinct()`
 - 查看 FilterSet 中是否设置了 `distinct=True`
 
-### 8.4 软删除记录仍然出现？
+### 10.4 软删除记录仍然出现？
 - 确认使用了自定义过滤方法（如 `filter_assignee_id`）
 - 检查 Q 对象中是否包含 `deleted_at__isnull=True` 条件
 
 ---
 
-## 九、代码文件索引
+## 十一、代码文件索引
 
 | 层级 | 文件路径 | 职责 |
 |------|---------|------|
@@ -433,6 +770,10 @@ queryset = Issue.objects.filter(
 | 前端状态 | `packages/shared-state/src/store/rich-filters/filter.ts` | FilterInstance 核心类 |
 | 前端状态 | `packages/shared-state/src/store/rich-filters/filter-helpers.ts` | 过滤操作辅助类 |
 | 格式转换 | `packages/shared-state/src/store/work-item-filters/adapter.ts` | 工作项过滤器 Adapter |
+| 前端参数 | `apps/web/core/store/issue/helpers/issue-filter-helper.store.ts` | 过滤器参数序列化 |
+| 前端查询 | `apps/web/core/store/issue/project/issue.store.ts` | 查询触发与响应处理 |
 | 后端核心 | `apps/api/plane/utils/filters/filter_backend.py` | ComplexFilterBackend |
 | 后端核心 | `apps/api/plane/utils/filters/filterset.py` | BaseFilterSet 与 Q 对象构建 |
-| 业务实现 | `apps/api/plane/utils/filters/filterset.py` | IssueFilterSet 示例 |
+| 旧版过滤 | `apps/api/plane/utils/issue_filters.py` | 扁平参数过滤器 |
+| 业务视图 | `apps/api/plane/app/views/issue/base.py` | IssueViewSet 过滤管线 |
+| 基类视图 | `apps/api/plane/api/views/base.py` | BaseAPIView filter_queryset |
