@@ -706,6 +706,291 @@ async markAllNotificationsAsRead(
 
 ---
 
+## 关键一致性分析：未读计数与列表的时序及并发场景
+
+### 两次请求的严格时间顺序
+
+**代码证据**：`workspace-notifications.store.ts:337-363`
+
+```typescript
+getNotifications = async (workspaceSlug, loader, queryParamType) => {
+  this.loader = loader;
+  try {
+    const queryParams = this.generateNotificationQueryParams(queryParamType);
+    // ========== 第一步：未读计数请求（串行等待） ==========
+    await this.getUnreadNotificationsCount(workspaceSlug);
+    // ========== 第二步：通知列表请求（必须等第一步完成） ==========
+    const notificationResponse = await workspaceNotificationService.fetchNotifications(workspaceSlug, queryParams);
+    // 更新本地状态...
+  } catch (error) {
+    console.error(error);
+    throw error;
+  } finally {
+    runInAction(() => (this.loader = undefined));
+  }
+};
+```
+
+**关键结论**：两次请求是**串行执行**而非并行，`await` 关键字确保了：
+1. 必须等未读计数请求完成（成功或失败）后，才会发起通知列表请求
+2. 未读计数更新早于通知列表更新，两者存在时间差（网络RTT + 后端处理时间）
+
+---
+
+### 前端本地状态更新的两条独立路径
+
+未读计数的更新有 **两条互不相关的路径**：
+
+#### 路径A：拉取时的全量更新
+
+```
+getNotifications 触发
+       ↓
+await getUnreadNotificationsCount() → GET /unread/
+       ↓
+[后端] 读库查询最新count值
+       ↓
+set(this, "unreadNotificationsCount", unreadNotificationCount)
+       ↓
+      GET /notifications
+```
+
+**代码位置**：`workspace-notifications.store.ts:317-329`
+
+```typescript
+getUnreadNotificationsCount = async (workspaceSlug) => {
+  const unreadNotificationCount = await workspaceNotificationService.fetchUnreadNotificationsCount(workspaceSlug);
+  if (unreadNotificationCount)
+    runInAction(() => {
+      set(this, "unreadNotificationsCount", unreadNotificationCount);  // 全量覆盖
+    });
+  return unreadNotificationCount || undefined;
+};
+```
+
+#### 路径B：操作时的增量更新
+
+```
+用户执行单条操作（标记已读/未读）
+       ↓
+setUnreadNotificationsCount("decrement" | "increment")
+       ↓
+update(this.unreadNotificationsCount, countKey, 
+  (count) => +Math.max(0, type === "increment" ? count + 1 : count - 1)
+)
+```
+
+**代码位置**：`workspace-notifications.store.ts:288-309`
+
+```typescript
+setUnreadNotificationsCount = (type: "increment" | "decrement", newCount: number = 1): void => {
+  const validCount = Math.max(0, Math.abs(newCount));
+  switch (this.currentNotificationTab) {
+    case ENotificationTab.ALL:
+      update(this.unreadNotificationsCount, "total_unread_notifications_count",
+        (count) => +Math.max(0, type === "increment" ? count + validCount : count - validCount)
+      );
+      break;
+    case ENotificationTab.MENTIONS:
+      update(this.unreadNotificationsCount, "mention_unread_notifications_count",
+        (count) => +Math.max(0, type === "increment" ? count + validCount : count - validCount)
+      );
+      break;
+  }
+};
+```
+
+**关键区别**：
+- 路径A（拉取）：**全量覆盖**，直接用后端返回值替换本地状态
+- 路径B（操作）：**增量修改**，在当前值基础上 ±1
+
+---
+
+### 并发场景下的不一致性分析
+
+由于存在两条独立的更新路径，在并发操作时可能出现 **短暂的计数与列表不一致**。
+
+#### 场景1：拉取过程中并发标记已读
+
+**时序图**：
+
+```
+时间轴 →
+  │
+  ├─ T0: 触发 getNotifications()
+  │    ├─ 发起 GET /unread/
+  │    │  [后端查询T0时刻count = 10]
+  │    │
+  ├─ T1: 用户点击通知卡片（并发）
+  │    ├─ 乐观更新：count = 10 - 1 = 9
+  │    ├─ 发起 POST /read/
+  │    │  [后端更新DB，read_at = now()]
+  │    │
+  │    ├─ T0的 /unread/ 返回，count = 10
+  │    ├─ 全量覆盖：count = 10  ← 不一致！
+  │    │
+  │    ├─ 发起 GET /notifications/
+  │    │  [后端返回列表，该通知已标记已读]
+  │    │
+  │    └─ 更新列表：通知显示已读
+  │
+  └─ T2: 状态呈现
+       ├─ 未读计数显示：10（错误，应为9）
+       └─ 通知列表显示：该通知已读（正确）
+```
+
+**不一致表现**：
+- 未读计数：10（来自T0时刻的查询结果，已过期）
+- 通知列表：该通知已读（来自最新的列表查询）
+- 视觉上：用户看到"10条未读"但有一条通知显示已读
+
+**代码证据**：`notification.ts:194-212` 中乐观更新在 POST 请求之前，而 `getNotifications` 中未读计数请求也在进行中，两者竞争更新同一个 `unreadNotificationsCount` 对象。
+
+---
+
+#### 场景2：筛选切换与全部已读并发
+
+**时序图**：
+
+```
+时间轴 →
+  │
+  ├─ T0: 用户点击"全部已读"
+  │    ├─ 发起 POST /mark-all-read/
+  │    │  [后端批量更新所有通知read_at]
+  │    │
+  ├─ T1: 用户切换筛选条件（并发）
+  │    ├─ 清空本地缓存：set(this, "notifications", {})
+  │    ├─ 发起 getNotifications()
+  │    │  ├─ GET /unread/  [后端查询，可能还在更新中]
+  │    │  ├─ GET /notifications/
+  │    │
+  │    ├─ "全部已读"的POST返回成功
+  │    ├─ 本地更新：count = 0
+  │    │
+  │    ├─ /unread/ 返回 count = 5（读库延迟）
+  │    ├─ 全量覆盖：count = 5  ← 不一致！
+  │
+  └─ T2: 状态呈现
+       ├─ 未读计数显示：5（错误，应为0）
+       └─ 通知列表显示：已按新筛选条件加载
+```
+
+**不一致表现**：
+- 未读计数：5（来自读库的延迟数据）
+- 全部已读操作已完成，实际应为0
+- 通知列表：已按新筛选条件加载
+
+**代码证据**：`workspace-notifications.store.ts:370-401` 中"全部已读"失败时无回滚，而 `updateFilters` L234-241 会清空缓存并重新拉取，两者的更新顺序不确定。
+
+---
+
+#### 场景3：多次快速标记已读
+
+**时序图**：
+
+```
+时间轴 →
+  │
+  ├─ T0: 初始 count = 10
+  │
+  ├─ T1: 点击通知A → 乐观更新 count = 9 → POST /read/A
+  │
+  ├─ T2: 点击通知B → 乐观更新 count = 8 → POST /read/B
+  │
+  ├─ T3: 触发SWR重验证（窗口聚焦）
+  │    ├─ GET /unread/  [后端查询count = 9，A已更新但B还在处理]
+  │    ├─ 全量覆盖：count = 9  ← 不一致！
+  │
+  ├─ T4: POST /read/B 返回成功
+  │    └─ 同步状态，但count已被覆盖为9
+```
+
+**不一致表现**：
+- 未读计数：9（应为8）
+- 两条通知都已标记已读
+
+---
+
+### 不一致的纠正机制
+
+前端通过 **多层纠正机制** 确保不一致是**短暂的**，最终会收敛到一致状态：
+
+#### 机制1：下一次拉取的全量覆盖
+
+任何触发 `getNotifications` 的操作都会先调用 `getUnreadNotificationsCount`，而后者是**全量覆盖**本地状态：
+
+```typescript
+// getUnreadNotificationsCount 内部
+set(this, "unreadNotificationsCount", unreadNotificationCount);  // 直接替换，不是增量
+```
+
+**触发时机**：
+- 页面挂载（useSWR自动）
+- 筛选切换（updateFilters）
+- Tab切换（setCurrentNotificationTab）
+- 主动刷新（刷新按钮）
+- 分页加载（加载更多）
+- SWR自动重验证（窗口聚焦、缓存过期）
+
+#### 机制2：后端返回值覆盖乐观更新
+
+单条操作中，后端返回成功后会用后端的真实数据覆盖乐观更新值：
+
+```typescript
+// markNotificationAsRead 内部
+const notification = await workspaceNotificationService.markNotificationAsRead(workspaceSlug, this.id);
+if (notification) {
+  runInAction(() => this.mutateNotification(notification));  // 用后端返回值覆盖
+}
+```
+
+**关键**：通知列表的状态会被后端确认后的值覆盖，确保列表数据的准确性。
+
+#### 机制3：SWR自动重验证
+
+SWR配置 `revalidateOnFocus: true` 和 `revalidateIfStale: true` 确保：
+- 窗口重新获得焦点时自动重拉取
+- 缓存过期后自动重拉取
+- 每次重拉取都会先拉未读计数，再拉通知列表
+
+**代码位置**：`packages/constants/src/swr.ts:16-22`
+
+```typescript
+export const WEB_SWR_CONFIG = {
+  revalidateIfStale: true,
+  revalidateOnFocus: true,
+  revalidateOnMount: true,
+  errorRetryCount: 3,
+};
+```
+
+#### 机制4：操作成功后的隐式同步
+
+虽然代码中没有显式在操作成功后调用 `getNotifications`，但：
+1. 单条操作成功后，后端返回的通知数据会更新本地列表（`mutateNotification`）
+2. 下一次用户交互（如滚动、切换Tab）会触发拉取
+3. SWR的自动重验证会在后台静默纠正
+
+---
+
+### 一致性保证分析
+
+| 场景 | 不一致持续时间 | 最终一致性保证 | 关键机制 |
+|-----|--------------|--------------|---------|
+| 拉取中标记已读 | 短暂（直到下一次拉取） | ✓ 是 | 全量覆盖 + SWR重验证 |
+| 筛选与全部已读并发 | 短暂（直到下一次拉取） | ✓ 是 | 全量覆盖 + SWR重验证 |
+| 多次快速标记已读 | 短暂（直到下一次拉取） | ✓ 是 | 全量覆盖 + 后端返回覆盖 |
+| 未读计数与列表数据差 | 两次请求之间的RTT | ✓ 是 | 串行请求确保计数先更新 |
+
+**设计权衡**：
+- 牺牲了**强一致性**（允许短暂不一致）
+- 获得了**更好的用户体验**（乐观更新无等待）
+- 通过**最终一致性**（多层纠正机制）确保数据最终正确
+- 不一致仅影响未读计数的数字显示，不影响通知列表的实际状态
+
+---
+
 ### 状态字段变更矩阵
 
 | 操作 | 字段变更 | 代码位置 | 落库表 | 模式 |
@@ -796,3 +1081,8 @@ async markAllNotificationsAsRead(
 8. **SWR自动重验证**：利用SWR的revalidateOnFocus/revalidateOnMount特性实现静默刷新
 9. **防重复提交**：所有用户操作都通过 `loader` 状态防止重复请求
 10. **游标分页**：使用游标模式而非页码分页，提升大数据量下的查询性能
+11. **最终一致性设计**：
+    - 未读计数采用两条独立更新路径（全量覆盖 + 增量修改）
+    - 允许短暂的计数与列表不一致，通过多层纠正机制最终收敛
+    - 牺牲强一致性换取更好的用户体验（乐观更新无等待）
+12. **串行请求保证**：未读计数与通知列表请求串行执行（`await` 关键字），确保计数先更新
