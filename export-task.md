@@ -318,3 +318,335 @@ async getExportsServicesList(workspaceSlug, cursor, per_page) {
 | `apps/web/core/services/project/project-export.service.ts` | 前端导出请求服务 |
 | `apps/web/core/services/integrations/integration.service.ts` | 前端导出历史查询服务 |
 | `apps/web/core/components/exporter/prev-exports.tsx` | 导出历史列表 + 轮询组件 |
+| `apps/web/core/components/exporter/column.tsx` | 导出列表列定义 + 过期判定 |
+| `apps/web/core/components/exporter/single-export.tsx` | 单条导出记录展示组件 |
+| `apps/api/plane/bgtasks/exporter_expired_task.py` | 过期导出清理任务 |
+| `apps/api/plane/celery.py` | Celery Beat 定时任务配置 |
+
+---
+
+## 八、过期清理机制：后台回收下载地址
+
+### 8.1 定时任务配置
+
+**文件**: `apps/api/plane/celery.py`
+
+```python
+app.conf.beat_schedule = {
+    # 每天 UTC 01:30 执行一次
+    "check-every-day-to-delete_exporter_history": {
+        "task": "plane.bgtasks.exporter_expired_task.delete_old_s3_link",
+        "schedule": crontab(hour=1, minute=30),  # UTC 01:30
+    },
+    # 每天 UTC 03:45 再次执行（双重保险）
+    "check-every-day-to-delete-exporter-history": {
+        "task": "plane.bgtasks.exporter_expired_task.delete_old_s3_link",
+        "schedule": crontab(hour=3, minute=45),  # UTC 03:45
+    },
+}
+```
+
+**设计考量**:
+- 每天执行两次，确保清理任务不会因为单次执行失败而遗漏
+- 选择低峰时段（UTC 凌晨）执行，避免影响用户体验
+- 任务注册在 `CELERY_IMPORTS` 中：`"plane.bgtasks.exporter_expired_task"`
+
+### 8.2 清理任务实现
+
+**文件**: `apps/api/plane/bgtasks/exporter_expired_task.py`
+
+```python
+@shared_task
+def delete_old_s3_link():
+    # 找出创建时间 >= 8天 的导出记录（比7天有效期多1天缓冲期）
+    expired_exporter_history = ExporterHistory.objects.filter(
+        Q(url__isnull=False) & Q(created_at__lte=timezone.now() - timedelta(days=8))
+    ).values_list("key", "id")
+    
+    for file_name, exporter_id in expired_exporter_history:
+        # 1. 从 S3/MinIO 物理删除文件
+        if file_name:
+            s3.delete_object(Bucket=bucket_name, Key=file_name)
+        
+        # 2. 数据库中将 url 置空（不删除记录，保留历史）
+        ExporterHistory.objects.filter(id=exporter_id).update(url=None)
+```
+
+### 8.3 清理策略详解
+
+| 维度 | 策略 | 说明 |
+|-----|------|------|
+| **清理阈值** | 创建时间 >= 8天 | 比预签名URL的7天有效期多1天缓冲 |
+| **筛选条件** | `url__isnull=False` | 只处理有下载链接的记录 |
+| **物理删除** | S3 文件删除 | 释放存储空间 |
+| **数据库处理** | `url=None` | 保留历史记录，仅清空下载链接 |
+| **保留历史** | 不删除 ExporterHistory | 保留审计痕迹 |
+| **执行频率** | 每天2次 | UTC 01:30 和 03:45 |
+
+### 8.4 清理前后对比
+
+```
+清理前:
+ExporterHistory {
+    status: "completed",
+    url: "https://s3.amazonaws.com/.../export.zip?X-Amz-Signature=...",
+    key: "workspace_id/export-slug-abc123-2026-05-12.zip",
+    created_at: "2026-05-12T10:00:00Z"
+}
+S3: 存在 export.zip 文件
+
+清理后 (2026-05-20 执行):
+ExporterHistory {
+    status: "completed",  // 状态不变
+    url: null,            // 下载链接被清空
+    key: "...",           // key 保留（用于审计）
+    created_at: "2026-05-12T10:00:00Z"  // 创建时间不变
+}
+S3: export.zip 文件已被删除
+```
+
+---
+
+## 九、前端过期判定与状态展示
+
+### 9.1 过期判定逻辑
+
+前端通过 **纯客户端计算** 判定链接是否过期，不依赖后端状态字段。
+
+**文件**: `apps/web/core/components/exporter/column.tsx:12-18` 和 `apps/web/core/components/exporter/single-export.tsx:25-31`
+
+```typescript
+const checkExpiry = (inputDateString: string) => {
+  const currentDate = new Date();
+  const expiryDate = getDate(inputDateString);  // 解析 created_at
+  if (!expiryDate) return false;
+  expiryDate.setDate(expiryDate.getDate() + 7);  // 创建时间 + 7天
+  return expiryDate > currentDate;  // 比较当前时间
+};
+```
+
+**判定公式**:
+```
+是否过期 = (创建时间 + 7天) <= 当前时间
+```
+
+**双重过期判定**:
+1. **客户端判定**: 每次渲染时实时计算 `created_at + 7天`
+2. **服务端判定**: 后台定时任务将 `url` 置空（8天阈值）
+
+这意味着在第7天到第8天之间，客户端会显示 "Expired"，但 S3 文件还在；第8天后，后台任务清理文件和 `url`。
+
+### 9.2 状态颜色映射
+
+**文件**: `apps/web/core/components/exporter/column.tsx:77-93`
+
+```typescript
+className={`rounded-sm px-2 py-1 text-11 capitalize ${
+  rowData.status === "completed"
+    ? "bg-success-subtle text-success-primary"    // 绿色
+    : rowData.status === "processing"
+      ? "bg-yellow-500/20 text-yellow-500"       // 黄色
+      : rowData.status === "failed"
+        ? "bg-danger-subtle text-danger-primary" // 红色
+        : rowData.status === "expired"
+          ? "bg-orange-500/20 text-orange-500"   // 橙色
+          : "bg-gray-500/20 text-gray-500"       // 灰色（queued）
+}`}
+```
+
+### 9.3 状态展示矩阵
+
+| 后端 status | 前端 checkExpiry() | 展示状态 | 下载按钮 |
+|------------|-------------------|---------|---------|
+| `queued` | - | 灰色 "queued" | 显示 `-` |
+| `processing` | - | 黄色 "processing" | 显示 `-` |
+| `completed` | `true` (<7天) | 绿色 "completed" | 可点击 "Download" |
+| `completed` | `false` (>=7天) | 绿色 "completed" | 显示 "Expired" |
+| `failed` | - | 红色 "failed" | 显示 `-` |
+
+**注意**: `expired` 状态仅在前端逻辑中存在，后端数据库没有 `expired` 这个状态值。后端的 `completed` 记录在超过7天后，前端会把它当作过期处理。
+
+### 9.4 下载按钮渲染逻辑
+
+**文件**: `apps/web/core/components/exporter/column.tsx:98-114`
+
+```typescript
+tdRender: (rowData: RowData) =>
+  checkExpiry(rowData.created_at) ? (
+    // 未过期
+    rowData.status == "completed" ? (
+      <a target="_blank" href={rowData?.url} rel="noopener noreferrer">
+        <button className="flex w-full items-center gap-1 font-medium text-accent-primary">
+          <Download className="h-4 w-4" />
+          <div>Download</div>
+        </button>
+      </a>
+    ) : (
+      "-"  // processing/queued/failed 状态
+    )
+  ) : (
+    // 已过期
+    <div className="text-11 text-danger-primary">Expired</div>
+  ),
+```
+
+---
+
+## 十、轮询机制详解：queued 与 processing 的差异
+
+### 10.1 轮询触发条件
+
+**文件**: `apps/web/core/components/exporter/prev-exports.tsx:54-64`
+
+```typescript
+useEffect(() => {
+  const interval = setInterval(() => {
+    // 只要有任何一条记录处于 processing 状态，就继续轮询
+    if (exporterServices?.results?.some((service) => service.status === "processing")) {
+      handleRefresh();  // 调用 SWR mutate 刷新
+    } else {
+      clearInterval(interval);  // 没有 processing 任务，停止轮询
+    }
+  }, 3000);  // 每3秒轮询一次
+
+  return () => clearInterval(interval);  // 组件卸载时清理定时器
+}, [exporterServices]);  // 依赖项：exporterServices 变化时重建定时器
+```
+
+### 10.2 queued vs processing 状态对轮询的影响
+
+| 状态 | 是否触发轮询 | 说明 |
+|-----|------------|------|
+| `queued` | ❌ 不触发 | 轮询条件只检查 `status === "processing"` |
+| `processing` | ✅ 触发 | 持续每3秒刷新，直到状态变更 |
+| `completed` | ❌ 不触发 | 任务完成，无需再轮询 |
+| `failed` | ❌ 不触发 | 任务失败，无需再轮询 |
+
+**关键发现**: `queued` 状态的任务 **不会触发自动轮询**。这意味着：
+- 如果任务长时间卡在 `queued` 状态（如 Celery Worker 挂了），前端不会自动刷新
+- 用户必须手动点击 "Refresh Status" 按钮才能看到最新状态
+- 只有当任务进入 `processing` 状态后，自动轮询才会启动
+
+### 10.3 轮询启停时序图
+
+```
+用户发起导出
+    ↓
+ExporterHistory 创建 (status=queued)
+    ↓
+页面显示灰色 "queued" 状态
+    ↓
+[此时不会自动轮询]
+    ↓
+Celery Worker 开始执行
+    ↓
+status 变为 processing
+    ↓
+用户刷新页面 / 手动刷新
+    ↓
+exporterServices 更新，包含 processing 任务
+    ↓
+useEffect 检测到 processing，启动 3s 轮询
+    ↓
+每隔 3s 调用 handleRefresh() → mutate() → GET /export-issues/
+    ↓
+任务完成，status 变为 completed
+    ↓
+下一次轮询检测到无 processing 任务
+    ↓
+clearInterval(interval)，停止轮询
+```
+
+### 10.4 手动刷新机制
+
+**文件**: `apps/web/core/components/exporter/prev-exports.tsx:49-52`
+
+```typescript
+const handleRefresh = () => {
+  setRefreshing(true);
+  // 调用 SWR 的 mutate 强制重新获取数据
+  mutate(EXPORT_SERVICES_LIST(workspaceSlug, `${cursor}`, `${per_page}`))
+    .then(() => setRefreshing(false));
+};
+```
+
+**手动刷新触发场景**:
+1. 用户点击 "Refresh Status" 按钮
+2. 自动轮询每隔 3 秒调用一次（当有 processing 任务时）
+
+### 10.5 潜在问题与优化点
+
+**当前设计的局限**:
+```
+问题: queued 状态的任务不会触发自动轮询
+场景: 
+  1. 用户发起导出 → status=queued
+  2. Celery Worker 因为某些原因延迟 pickup 任务
+  3. 前端页面一直显示 queued，不会自动刷新
+  4. 用户以为导出卡住了，可能重复发起导出
+```
+
+**建议优化**: 轮询条件应该同时检查 `queued` 和 `processing`:
+```typescript
+// 优化前（当前）
+if (exporterServices?.results?.some((service) => service.status === "processing"))
+
+// 优化后
+if (exporterServices?.results?.some((service) => 
+    service.status === "processing" || service.status === "queued"
+))
+```
+
+---
+
+## 十一、完整生命周期闭环
+
+### 11.1 全流程时间线
+
+```
+T+0s:     用户点击 Export 按钮
+          ↓ POST /export-issues/
+T+0.1s:   ExporterHistory 创建 (status=queued, token=xxx)
+          ↓ issue_export_task.delay() 提交到 Celery 队列
+T+0.2s:   API 返回 200 OK，前端显示成功提示
+          ↓
+T+0.5s:   用户跳转到导出列表页
+          ↓ GET /export-issues/?per_page=10&cursor=...
+          ↓ 显示 status=queued（灰色）
+          ↓ [无自动轮询，因为 queued 不触发]
+          ↓
+T+2s:     Celery Worker pickup 任务
+          ↓ status 更新为 processing
+          ↓
+T+2.1s:   [用户手动刷新 或 下一次自动轮询]
+          ↓ 获取到 processing 状态
+          ↓ 启动 3s 自动轮询
+          ↓
+T+5s:     第一轮轮询，仍在 processing
+T+8s:     第二轮轮询，仍在 processing
+...       (持续轮询)
+          ↓
+T+N s:    后台处理完成，status=completed, url=预签名链接
+          ↓
+T+N+3s:   轮询检测到 completed，无 processing 任务
+          ↓ 停止轮询
+          ↓ 显示绿色 completed + Download 按钮
+          ↓
+T+7天:    前端 checkExpiry() 返回 false
+          ↓ Download 按钮变为 "Expired"
+          ↓
+T+8天:    后台定时任务执行
+          ↓ S3 文件被删除，url 被置空
+```
+
+### 11.2 状态流转完整表
+
+| 阶段 | 后端 status | 前端展示 | 自动轮询 | 下载按钮 |
+|-----|------------|---------|---------|---------|
+| 刚创建 | `queued` | 灰色 queued | ❌ 停止 | `-` |
+| 处理中 | `processing` | 黄色 processing | ✅ 运行中 | `-` |
+| 完成 (<7天) | `completed` | 绿色 completed | ❌ 停止 | 可下载 |
+| 完成 (>=7天) | `completed` | 绿色 completed | ❌ 停止 | Expired |
+| 完成 (>=8天) | `completed` (url=null) | 绿色 completed | ❌ 停止 | Expired |
+| 失败 | `failed` | 红色 failed | ❌ 停止 | `-` |
+
