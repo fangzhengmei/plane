@@ -880,4 +880,225 @@ checkExpiry(rowData.created_at) ? (
 
 **修复建议**: `single-export.tsx` 第53行的 `: ""` 改为 `: "bg-gray-500/20 text-gray-500"`，与列表组件保持一致。
 
+---
+
+## 十五、日级截断误差量化分析
+
+### 15.1 getDate() 函数实现细节
+
+**文件**: `packages/utils/src/datetime.ts:283-299`
+
+```typescript
+export const getDate = (date: string | Date | undefined | null): Date | undefined => {
+  try {
+    if (!date || date === "") return;
+    if (typeof date !== "string" && !(date instanceof String)) return date;
+
+    // 只取前10个字符（YYYY-MM-DD），截断时分秒
+    const [yearString, monthString, dayString] = date.substring(0, 10).split("-");
+    const year = parseInt(yearString);
+    const month = parseInt(monthString);
+    const day = parseInt(dayString);
+    if (!isNumber(year) || !isNumber(month) || !isNumber(day)) return;
+
+    // 构造 Date 时只传年月日，时间固定为 00:00:00 本地时间
+    return new Date(year, month - 1, day);
+  } catch (_e) {
+    return undefined;
+  }
+};
+```
+
+**关键特性**:
+- **截断粒度**: 只保留到日级（`date.substring(0, 10)`），丢弃时、分、秒、毫秒
+- **时区**: 使用本地时区构造 `new Date(year, month-1, day)`，时间固定为当天 00:00:00
+- **与 S3 预签名对比**: S3 预签名过期是精确到秒级的（基于生成时间 + 7 \* 86400 秒）
+
+### 15.2 误差量化计算
+
+设 `T_created` = 任务创建 ISO 时间（精确到毫秒），如 `"2026-05-19T14:30:45.123Z"`
+
+| 时间点 | 实际值 | getDate() 解析后 | 误差 |
+|-------|-------|-----------------|------|
+| T_created | 2026-05-19T14:30:45.123Z | 2026-05-19T00:00:00.000（本地） | 丢失 14h30m45s |
+| T_created + 7天（真实过期） | 2026-05-26T14:30:45.123Z | - | - |
+| 前端判定过期时间 | - | 2026-05-26T00:00:00.000（本地） | 提前 14h30m45s |
+
+**最大误差场景**：
+```
+任务创建于:   2026-05-19T23:59:59.999Z （当天最后1毫秒）
+getDate解析:  2026-05-19T00:00:00.000  （丢失23h59m59s）
++7天过期:     2026-05-26T23:59:59.999Z （S3真实过期）
+前端判定:     2026-05-26T00:00:00.000  （提前了23h59m59s！）
+```
+
+**结论**: 最大日级截断误差可达 **23小时59分59秒**，几乎一整天。
+
+### 15.3 三者时间窗口并排对照
+
+| 基准 | 计算公式 | 精度 | 典型误差 |
+|-----|---------|------|---------|
+| **S3 预签名真实过期** | `T_url_gen + 7*86400秒` | 秒级 | 无误差（S3强制校验） |
+| **前端过期判定** | `getDate(T_created) + 7天 00:00:00` | 日级 | 0 ~ 24小时 提前 |
+| **后台清理窗口** | `T_created + 8天 00:00:00` | 日级 | 0 ~ 24小时 延后 |
+
+**时间轴示意**:
+```
+T_created (14:30)                T_created+7天 (14:30)          T_created+8天 (00:00)
+    │                                   │                                   │
+    ▼                                   ▼                                   ▼
+    ├───────────────────────────────────┼───────────────────────────────────┤
+    │                                   │                                   │
+    │  前端判定过期点 (当天00:00)        │  S3真实过期点 (精确到秒)           │  后台清理点 (当天00:00)
+    │      (提前了14.5小时)              │                                   │
+    ▼                                   ▼                                   ▼
+    ◆───────────────────────────────────◆───────────────────────────────────◆
+
+<─────────────────────── 前端显示 Expired 但 URL 仍有效 ───────────────────────>
+                    最短14.5小时，最长可达约38.5小时（跨时区+日截断）
+```
+
+### 15.4 复合误差：日截断 + 任务执行耗时
+
+如果任务执行耗时 ΔT = 3小时：
+
+```
+T_created:   2026-05-19T23:00:00Z （当天深夜）
+getDate:     2026-05-19T00:00:00   （丢失23小时）
+T_url_gen:   2026-05-20T02:00:00Z  （任务执行了3小时）
+S3过期:      2026-05-27T02:00:00Z  （+7天）
+前端判定:    2026-05-26T00:00:00   （+7天00:00）
+
+前端提前量:  2天2小时 = 50小时！
+```
+
+---
+
+## 十六、SingleExport 组件引用分析
+
+### 16.1 引用排查结果
+
+```bash
+$ grep -r "SingleExport\|from.*single-export" apps/web/
+# 无结果
+
+$ grep -r "<SingleExport" apps/web/
+# 无结果
+```
+
+**结论**: `single-export.tsx` 组件**未被项目中任何代码引用**，属于死代码。
+
+### 16.2 对当前用户路径的影响
+
+**当前生效的展示路径**:
+```
+用户访问 /{workspace}/settings/exports
+    ↓
+ExportGuide 组件 (guide.tsx)
+    ├─ ExportForm 组件 (export-form.tsx)  ← 导出表单
+    └─ PrevExports 组件 (prev-exports.tsx)  ← 导出历史列表
+          └─ useExportColumns (column.tsx)  ← 列表列定义
+```
+
+**影响分析**:
+| 维度 | 影响 |
+|-----|------|
+| **当前用户** | ❌ 无影响。用户看不到 SingleExport 组件 |
+| **功能完整性** | ❌ 无影响。导出功能通过 PrevExports 完整呈现 |
+| **代码维护** | ⚠️ 存在风险。两个功能重复的组件需要同步维护 |
+| **潜在回归** | 如果未来有人引入 SingleExport，会遇到 queued 状态无样式的 bug |
+
+### 16.3 处置建议
+
+| 方案 | 操作 | 适用场景 |
+|-----|------|---------|
+| **方案 A** | 删除 `single-export.tsx` | 确认未来不需要独立展示单条导出记录 |
+| **方案 B** | 修复 queued 状态样式，保留组件 | 计划在其他页面使用该组件 |
+| **方案 C** | 提取公共逻辑，合并两个组件 | 长期维护优化 |
+
+---
+
+## 十七、rich_filters 实际影响范围分析
+
+### 17.1 当前状态全景
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   rich_filters 链路现状                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  前端 export-form.tsx:                                           │
+│    ├─ FormData.filters 字段定义: ✅ 存在 (第42行)                │
+│    ├─ useForm defaultValues.filters: ✅ {} (空对象) (第74行)     │
+│    ├─ 筛选器 UI: ❌ 完全注释 (第217-258行)                        │
+│    ├─ 提交 payload.rich_filters: ✅ formData.filters (第107行)   │
+│    └─ 最终发送值: ✅ {} (空对象，因为UI被注释)                    │
+│                                                                 │
+│  后端 ExportIssuesEndpoint.post():                               │
+│    └─ 提取 rich_filters: ❌ 完全未读取 request.data              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 17.2 逐层影响分析
+
+**第一层：前端表单默认值**
+```typescript
+// export-form.tsx:69-76
+const { handleSubmit, control } = useForm<FormData>({
+  defaultValues: {
+    provider: EXPORTERS_LIST[0],
+    project: [],
+    multiple: false,
+    filters: {},  // ✅ 默认空对象
+  },
+});
+```
+
+**影响**: 即使用户看不到筛选器，`filters` 字段始终存在于表单状态中，值为 `{}`。
+
+**第二层：筛选器 UI 注释状态**
+- 注释掉的代码包括 `WorkspaceLevelWorkItemFiltersHOC` 和 `WorkItemFiltersRow`
+- 用户**无法**在界面上设置任何筛选条件
+- `initialWorkItemFilters` 也被注释了（第45-53行），即使取消UI注释也会报错
+
+**第三层：提交 payload**
+```typescript
+// export-form.tsx:103-108
+const payload = {
+  provider: formData.provider.provider,
+  project: formData.project,
+  multiple: formData.project.length > 1,
+  rich_filters: formData.filters,  // ✅ 发送了，但值永远是 {}
+};
+```
+
+**第四层：后端接收**
+- 后端完全不读取 `rich_filters`，即使前端发送了也没用
+- 导出查询始终是 `Issue.objects.filter(workspace_id=..., project_id__in=...)`
+
+### 17.3 实际影响边界
+
+| 场景 | 实际行为 | 影响 |
+|-----|---------|------|
+| 用户正常导出 | 导出所选项目的 **全部 issues** | ✅ 符合当前预期（因为筛选器UI不存在） |
+| 用户取消UI注释尝试筛选 | 仍然导出全部 issues | ❌ 筛选条件不生效，用户困惑 |
+| 修复后端处理逻辑 | 需要同时修复前端UI才能使用 | ⚠️ 前后端需同步修改 |
+| 第三方通过API直接调用 | 可以传 rich_filters，但后端忽略 | ❌ API 契约不一致 |
+
+### 17.4 完全启用 rich_filters 的完整修改清单
+
+要让筛选功能真正可用，需要完成 **7 处修改**：
+
+| 序号 | 文件 | 修改内容 |
+|-----|------|---------|
+| 1 | `export-form.tsx:45-53` | 取消 `initialWorkItemFilters` 注释 |
+| 2 | `export-form.tsx:217-258` | 取消筛选器 UI 注释 |
+| 3 | `export-form.tsx:11` | 取消 `ISSUE_DISPLAY_FILTERS_BY_PAGE` 导入注释 |
+| 4 | `views/exporter/base.py:27-29` | 提取 `rich_filters = request.data.get("rich_filters", {})` |
+| 5 | `views/exporter/base.py:41-47` | 创建 ExporterHistory 时传入 `rich_filters=rich_filters` |
+| 6 | `views/exporter/base.py:49-56` | `issue_export_task.delay()` 增加 `rich_filters` 参数 |
+| 7 | `bgtasks/export_task.py:128-135, 148-155` | 接收 `rich_filters` 参数并应用到查询条件 |
+
+
 
