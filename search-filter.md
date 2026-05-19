@@ -857,7 +857,190 @@ print(f"3. 最终SQL WHERE: {str(issue_queryset.query)}")
 
 ---
 
-## 九、完整链路示例
+## 九、Endpoint 级执行顺序对照
+
+不同的 Issue 接口在过滤条件的执行顺序上存在细微但重要的差异。理解这些差异对于准确排查结果偏差至关重要。
+
+### 9.1 IssueViewSet.list vs IssueDetailEndpoint.get 对比
+
+#### 9.1.1 IssueViewSet.list 执行顺序
+
+**代码位置**：`apps/api/plane/app/views/issue/base.py:254-352`
+
+```python
+def list(self, request, slug, project_id):
+    # 1. 解析旧版过滤器（但不应用）
+    filters = issue_filters(query_params, "GET")
+    
+    # 2. 基础查询
+    issue_queryset = self.get_queryset()
+    
+    # 3. 应用富过滤器 (ComplexFilterBackend)
+    issue_queryset = self.filter_queryset(issue_queryset)
+    
+    # 4. 应用旧版过滤器
+    issue_queryset = issue_queryset.filter(**filters, **extra_filters)
+    
+    # 5. 权限约束（访客过滤）
+    if (is_guest and not project.guest_view_all_features):
+        issue_queryset = issue_queryset.filter(created_by=request.user)
+```
+
+**执行顺序**：
+```
+基础查询 → 富过滤器 → 旧版过滤器 → 权限约束
+```
+
+**关键点**：
+- 旧版过滤器先解析，后应用（在富过滤器之后）
+- 权限约束在**最后**，优先级最高，无法被前面的过滤条件绕过
+
+---
+
+#### 9.1.2 IssueDetailEndpoint.get 执行顺序
+
+**代码位置**：`apps/api/plane/app/views/issue/base.py:1016-1091`
+
+```python
+def get(self, request, slug, project_id):
+    # 1. 解析旧版过滤器（但不应用）
+    filters = issue_filters(request.query_params, "GET")
+    
+    # 2. 基础查询 + 权限子查询（最优先）
+    issue = Issue.issue_objects.filter(workspace__slug=slug, project_id=project_id) \
+                                .filter(Exists(permission_subquery))
+    
+    # 3. 应用富过滤器
+    issue = self.filter_queryset(issue)
+    
+    # 4. 应用旧版过滤器
+    issue = issue.filter(**filters)
+```
+
+**执行顺序**：
+```
+基础查询 → 权限约束（嵌入）→ 富过滤器 → 旧版过滤器
+```
+
+**关键点**：
+- 权限约束**嵌入在基础查询**中，使用 `EXISTS` 子查询实现
+- 权限约束在**最前面**，在富过滤器和旧版过滤器之前生效
+- 权限逻辑更复杂，支持三种角色场景（管理员/成员、访客+查看所有、访客+仅自己）
+
+---
+
+### 9.2 执行顺序差异对照表
+
+| 维度 | IssueViewSet.list | IssueDetailEndpoint.get | 影响 |
+|------|------------------|-------------------------|------|
+| **权限约束时机** | 最后（过滤后） | 最前（基础查询中） | list 端点权限检查在分页/统计之后，detail 端点在最前 |
+| **权限实现方式** | 简单 `.filter(created_by=user)` | 复杂 `EXISTS` 子查询 | detail 端点权限逻辑更精细，支持三种角色场景 |
+| **过滤叠加关系** | 富过滤器 → 旧版 → 权限 | 权限 → 富过滤器 → 旧版 | 权限在 list 中优先级最高，在 detail 中同样最高但实现不同 |
+| **过滤拷贝时机** | 旧版过滤器结果被传入 `issue_group_values` 用于分组统计 | 仅用于结果过滤 | list 端点旧版过滤器结果被复用在多个地方 |
+| **适用场景** | 列表页、看板、表格等多结果展示 | 详情页、展开视图等单结果展示 | 排查时需根据调用的端点选择不同的分析路径 |
+
+### 9.3 对同字段重叠场景排查的影响
+
+#### 9.3.1 场景1：结果为空但条件单独有效
+
+**在 list 端点排查**：
+1. ✅ 检查旧版过滤器是否在富过滤器之后**额外添加**了冲突条件
+2. ✅ 检查权限约束是否在**最后**进一步缩小了结果集
+3. ❌ 不需要检查权限是否在过滤前排除了数据（权限在最后）
+
+**在 detail 端点排查**：
+1. ✅ 检查权限子查询是否在**最前面**就排除了数据
+2. ✅ 检查富过滤器是否在权限基础上**进一步**缩小了范围
+3. ✅ 检查旧版过滤器是否在**最后**添加了冲突条件
+
+#### 9.3.2 场景2：权限约束导致的结果偏差
+
+**list 端点**：
+```python
+# 权限在最后，相当于在所有过滤条件上再加一层
+queryset = (
+    Issue.objects.filter(workspace=slug, project=pid)
+    .filter(rich_filters_q)           # 富过滤器
+    .filter(**legacy_filters)          # 旧版过滤器
+    .filter(created_by=request.user)   # 权限约束（最后）
+)
+```
+→ 即使过滤条件匹配，访客用户也只能看到自己创建的
+
+**detail 端点**：
+```python
+# 权限嵌入在基础查询中，使用 EXISTS 子查询
+queryset = (
+    Issue.objects.filter(workspace=slug, project=pid)
+    .filter(Exists(permission_subquery))  # 权限约束（最前）
+    .filter(rich_filters_q)               # 富过滤器
+    .filter(**legacy_filters)             # 旧版过滤器
+)
+```
+→ 权限不通过的 issue 甚至不会进入后续过滤流程
+
+#### 9.3.3 场景3：分页/统计与实际结果不一致
+
+**问题表现**：list 端点返回的 total_count 与实际分页结果数量不符
+
+**排查路径**：
+1. 权限约束在 `filtered_issue_queryset` 被拷贝**之后**才应用
+2. 分组统计使用的是 `filtered_issue_queryset`（不含权限约束）
+3. 最终返回的 `issue_queryset` 包含权限约束
+4. 这是设计意图：分组统计显示全量数据，实际返回受权限约束
+
+```python
+# 代码位置: base.py:274, 308-309
+filtered_issue_queryset = copy.deepcopy(issue_queryset)  # 拷贝时还没加权限
+
+# ... 中间应用了各种过滤 ...
+
+# 权限在拷贝之后才加
+issue_queryset = issue_queryset.filter(created_by=request.user)
+filtered_issue_queryset = filtered_issue_queryset.filter(created_by=request.user)
+```
+
+> ⚠️ **注意**：`filtered_issue_queryset` 在拷贝后也被应用了权限约束，所以实际上统计结果是准确的。但如果代码版本不同，可能存在不一致。
+
+### 9.4 排查时的端点判断方法
+
+当遇到过滤结果偏差时，首先确定调用的是哪个端点：
+
+| 端点特征 | 判定方法 | 排查侧重点 |
+|---------|---------|-----------|
+| **list 端点** | URL 为 `/api/v1/workspaces/{slug}/projects/{pid}/issues/` | 检查权限是否在最后过滤掉了结果 |
+| **detail 列表端点** | URL 为 `/api/v1/workspaces/{slug}/projects/{pid}/issues/` 但使用 `IssueDetailEndpoint` | 检查权限子查询是否在最前面排除了数据 |
+| **单个详情** | URL 包含 `issue_id` 或 `issue_identifier` | 通常不涉及过滤条件叠加，主要检查权限 |
+
+**快速判断调用的类**：在 `base.py` 中搜索 URL 路径对应的 `as_view()` 调用，或查看 Django 的 URL 配置。
+
+### 9.5 调试建议
+
+#### 针对 list 端点：
+```python
+# 在 list 方法中添加调试
+print(f"[LIST] 富过滤器后数量: {issue_queryset.count()}")
+print(f"[LIST] 旧版过滤器后数量: {issue_queryset.count()}")
+print(f"[LIST] 权限约束后数量: {issue_queryset.count()}")
+```
+
+#### 针对 detail 端点：
+```python
+# 在 get 方法中添加调试
+print(f"[DETAIL] 权限后数量: {issue.count()}")
+print(f"[DETAIL] 富过滤器后数量: {issue.count()}")
+print(f"[DETAIL] 旧版过滤器后数量: {issue.count()}")
+```
+
+#### 通用调试：
+```python
+# 查看实际执行的 SQL
+print(f"最终SQL: {str(issue_queryset.query)}")
+```
+
+---
+
+## 十、完整链路示例
 
 ### 场景：用户在UI选择"状态为待办 且 优先级为高或紧急"
 
@@ -921,53 +1104,53 @@ queryset = Issue.objects.filter(
 
 ---
 
-## 十、关键设计决策
+## 十一、关键设计决策
 
-### 10.1 为什么使用表达式树而不是扁平字典？
+### 11.1 为什么使用表达式树而不是扁平字典？
 - 支持复杂的逻辑组合（AND/OR/NOT嵌套）
 - 每个条件有唯一标识，便于精确更新/删除
 - 类型安全，结构清晰
 
-### 10.2 为什么需要 Adapter 层？
+### 11.2 为什么需要 Adapter 层？
 - **解耦**：前端内部结构与后端API格式独立演化
 - **兼容**：支持不同业务场景的外部格式（工作项、自动化等）
 - **转换**：处理多值逗号分隔、特殊字段映射等
 
-### 10.3 后端为什么使用 Q 对象组合？
+### 11.3 后端为什么使用 Q 对象组合？
 - **性能**：所有条件一次性生成 SQL，避免多次查询
 - **灵活**：支持任意复杂的逻辑组合
 - **安全**：通过 FilterSet 白名单验证，防止SQL注入
 
-### 10.4 自定义过滤方法 vs 标准过滤
+### 11.4 自定义过滤方法 vs 标准过滤
 - **标准过滤**：直接映射数据库字段，性能最优
 - **自定义方法**：处理软删除、权限、复杂业务逻辑
 - 统一返回 Q 对象，保持组合逻辑一致
 
 ---
 
-## 十一、常见问题排查
+## 十二、常见问题排查
 
-### 11.1 过滤条件不生效？
+### 12.1 过滤条件不生效？
 1. 检查前端 `expression` 是否正确构建
 2. 检查 `toExternal` 转换后的格式是否正确
 3. 检查后端 `filters` 参数是否正确接收
 4. 查看 FilterSet 中是否声明了该字段
 
-### 11.2 多值条件只匹配第一个？
+### 12.2 多值条件只匹配第一个？
 - 确认操作符是 `__in` 而不是 `__exact`
 - 检查逗号分隔是否正确解析（`_parseFilterValue`）
 
-### 11.3 关联表过滤结果重复？
+### 12.3 关联表过滤结果重复？
 - 检查是否需要 `.distinct()`
 - 查看 FilterSet 中是否设置了 `distinct=True`
 
-### 11.4 软删除记录仍然出现？
+### 12.4 软删除记录仍然出现？
 - 确认使用了自定义过滤方法（如 `filter_assignee_id`）
 - 检查 Q 对象中是否包含 `deleted_at__isnull=True` 条件
 
 ---
 
-## 十二、代码文件索引
+## 十三、代码文件索引
 
 | 层级 | 文件路径 | 职责 |
 |------|---------|------|
