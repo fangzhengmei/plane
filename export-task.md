@@ -650,3 +650,234 @@ T+8天:    后台定时任务执行
 | 完成 (>=8天) | `completed` (url=null) | 绿色 completed | ❌ 停止 | Expired |
 | 失败 | `failed` | 红色 failed | ❌ 停止 | `-` |
 
+---
+
+## 十二、时间窗口对齐分析：预签名过期 vs 前端判定 vs 后台清理
+
+### 12.1 三个时间基准的定义
+
+| 时间点 | 定义 | 代码位置 |
+|-------|------|---------|
+| **T_created** | 任务创建时间（`ExporterHistory.created_at`） | `views/exporter/base.py:41-47` |
+| **T_url_gen** | 预签名 URL 生成时间（任务完成时间） | `bgtasks/export_task.py:75-79, 108-112` |
+| **T_now** | 当前时间（客户端/服务端本地时间） | 各处 `new Date()` / `timezone.now()` |
+
+### 12.2 三者的过期计算公式
+
+```
+预签名 URL 真实过期时间 = T_url_gen + 7天    （S3 端强制校验）
+前端过期判定时间       = T_created + 7天    （checkExpiry() 纯客户端计算）
+后台清理阈值时间       = T_created + 8天    （delete_old_s3_link()）
+```
+
+### 12.3 窗口错位分析
+
+**错位产生的根本原因**: `T_created` ≠ `T_url_gen`
+
+```
+T_created ──────────────────────────────────→ T_url_gen ──────────────────→ 真实过期
+            任务执行耗时 ΔT (几秒~几小时)                7天（S3 强制）
+
+T_created ────────────────────────────────────────────────────────────────→ 前端判定过期
+                                      7天（前端认为）
+
+T_created ──────────────────────────────────────────────────────────────────────────────→ 后台清理
+                                              8天（后台清理）
+```
+
+**错位场景举例**：
+
+| 场景 | 真实 URL 状态 | 前端显示 | 后台状态 | 错位影响 |
+|-----|-------------|---------|---------|---------|
+| ΔT = 0秒（理想） | 7天后过期 | 7天后 Expired | 8天后清理 | ✅ 完全对齐 |
+| ΔT = 1小时 | 7天+1小时后过期 | 7天后 Expired | 8天后清理 | ⚠️ 前端提前1小时显示过期 |
+| ΔT = 12小时 | 7天+12小时后过期 | 7天后 Expired | 8天后清理 | ⚠️ 前端提前12小时显示过期 |
+| ΔT = 3天（极端） | 10天后过期 | 7天后 Expired | 8天后清理 | ❌ 第7-8天前端显示Expired但URL仍有效；第8天后文件被删 |
+
+**结论**: 存在窗口错位问题。前端基于 `created_at` 判定过期，而 S3 预签名 URL 基于生成时间计算。任务执行耗时越长，错位越严重。
+
+### 12.4 修复建议
+
+**方案 A（推荐）**: 后端新增 `url_generated_at` 字段，前端基于此字段判定
+```python
+# 模型新增字段
+url_generated_at = models.DateTimeField(null=True, blank=True)
+
+# upload_to_s3() 中设置
+exporter_instance.url_generated_at = timezone.now()
+
+# 前端 checkExpiry() 使用 url_generated_at 而非 created_at
+```
+
+**方案 B（快速修复）**: 前端宽松判定，增加 1 天缓冲
+```typescript
+// 当前
+expiryDate.setDate(expiryDate.getDate() + 7)
+// 改为
+expiryDate.setDate(expiryDate.getDate() + 8)  // 与后台清理阈值一致
+```
+
+---
+
+## 十三、rich_filters 链路追踪：断点位置确认
+
+### 13.1 请求路径全链路追踪
+
+```
+前端 export-form.tsx
+    ↓
+payload = {
+  provider: "csv",
+  project: ["proj-1", "proj-2"],
+  multiple: true,
+  rich_filters: {...}   // ✅ 前端已发送
+}
+    ↓ POST /api/workspaces/{slug}/export-issues/
+    ↓
+后端 ExportIssuesEndpoint.post()
+    ↓
+provider = request.data.get("provider", False)   // ✅ 已提取
+multiple = request.data.get("multiple", False)   // ✅ 已提取
+project_ids = request.data.get("project", [])    // ✅ 已提取
+rich_filters = ???                               // ❌ 未提取！断点在此！
+    ↓
+ExporterHistory.objects.create(
+  workspace=workspace,
+  project=project_ids,
+  initiated_by=request.user,
+  provider=provider,
+  type="issue_exports",
+  // rich_filters 缺失，未保存到数据库
+)
+    ↓
+issue_export_task.delay(
+  provider=exporter.provider,
+  workspace_id=workspace.id,
+  project_ids=project_ids,
+  token_id=exporter.token,
+  multiple=multiple,
+  slug=slug,
+  // rich_filters 缺失，未传递给 Celery 任务
+)
+    ↓
+issue_export_task() 执行
+    ↓
+workspace_issues = Issue.objects.filter(
+  workspace__id=workspace_id,
+  project_id__in=project_ids,
+  // rich_filters 缺失，未应用到查询条件
+)
+```
+
+### 13.2 断点确认
+
+**断点位置**: `apps/api/plane/app/views/exporter/base.py:27-29`
+
+**根因**: `ExportIssuesEndpoint.post()` 方法只提取了 `provider`、`multiple`、`project` 三个参数，**完全没有读取 `request.data.get("rich_filters")`**。
+
+**影响范围**:
+- 前端 `export-form.tsx` 中的筛选器 UI 被注释掉了（217-258行），用户当前无法设置 rich_filters
+- 即使取消注释，筛选条件也不会生效，因为后端没有处理
+- 导出的始终是所选项目的 **全部 issues**，不受任何筛选条件限制
+
+### 13.3 修复路径
+
+要让 rich_filters 生效，需要修改以下 4 个位置：
+
+| 位置 | 修改内容 |
+|-----|---------|
+| 1. `views/exporter/base.py:41-47` | 提取 `rich_filters = request.data.get("rich_filters", {})`，创建时传入 |
+| 2. `db/models/exporter.py` | 已有 `rich_filters` 字段（第57行），无需修改 |
+| 3. `views/exporter/base.py:49-56` | `issue_export_task.delay()` 增加 `rich_filters=rich_filters` 参数 |
+| 4. `bgtasks/export_task.py:128-135` | 函数签名增加 `rich_filters` 参数，并应用到 `Issue.objects.filter()` |
+
+---
+
+## 十四、组件展示差异：queued 状态的分支对比
+
+### 14.1 两个展示组件的使用场景
+
+| 组件 | 使用场景 | 文件 |
+|-----|---------|------|
+| `PrevExports` + `useExportColumns` | 设置页导出历史列表（表格形式） | `prev-exports.tsx` + `column.tsx` |
+| `SingleExport` | 单个导出记录展示（列表形式，用于其他页面） | `single-export.tsx` |
+
+### 14.2 queued 状态展示对比
+
+| 维度 | 列表组件 (column.tsx) | 单条组件 (single-export.tsx) |
+|-----|----------------------|----------------------------|
+| **状态颜色** | `bg-gray-500/20 text-gray-500`（灰色） | `""`（空 class，无样式） |
+| **状态文字** | 显示 "queued" | 显示 "queued" |
+| **下载区** | 显示 `-` 占位符 | 空白（什么都不显示） |
+| **视觉效果** | 灰色标签清晰标识排队中 | 无背景色，文字与普通文字无异 |
+
+### 14.3 代码级对比
+
+**列表组件 - 状态样式** (`column.tsx:77-93`):
+```typescript
+className={`rounded-sm px-2 py-1 text-11 capitalize ${
+  rowData.status === "completed"
+    ? "bg-success-subtle text-success-primary"
+    : rowData.status === "processing"
+      ? "bg-yellow-500/20 text-yellow-500"
+      : rowData.status === "failed"
+        ? "bg-danger-subtle text-danger-primary"
+        : rowData.status === "expired"
+          ? "bg-orange-500/20 text-orange-500"
+          : "bg-gray-500/20 text-gray-500"  // ✅ queued 状态有灰色样式
+}`}
+```
+
+**单条组件 - 状态样式** (`single-export.tsx:43-54`):
+```typescript
+className={`rounded-sm px-2 py-0.5 text-11 capitalize ${
+  service.status === "completed"
+    ? "bg-success-subtle text-success-primary"
+    : service.status === "processing"
+      ? "bg-yellow-500/20 text-yellow-500"
+      : service.status === "failed"
+        ? "bg-danger-subtle text-danger-primary"
+        : service.status === "expired"
+          ? "bg-orange-500/20 text-orange-500"
+          : ""  // ❌ queued 状态无样式！
+}`}
+```
+
+**列表组件 - 下载区** (`column.tsx:98-114`):
+```typescript
+checkExpiry(rowData.created_at) ? (
+  rowData.status == "completed" ? (
+    <Download 按钮 />
+  ) : (
+    "-"  // ✅ queued/processing/failed 显示 "-"
+  )
+) : (
+  <div>Expired</div>
+)
+```
+
+**单条组件 - 下载区** (`single-export.tsx:64-78`):
+```typescript
+{checkExpiry(service.created_at) ? (
+  <>
+    {service.status == "completed" && (
+      <Download 按钮 />
+    )}
+    {/* ❌ queued/processing/failed 时什么都不渲染 */}
+  </>
+) : (
+  <div>Expired</div>
+)}
+```
+
+### 14.4 用户体验影响
+
+| 场景 | 列表组件表现 | 单条组件表现 | 影响 |
+|-----|------------|------------|------|
+| 刚发起导出 | 灰色 "queued" + `-` | 无样式 "queued" + 空白 | ⚠️ 单条组件用户可能看不到状态 |
+| 长时间 queued | 灰色标签持续显示 | 无样式文字，易被忽略 | ❌ 单条组件用户可能以为没提交成功 |
+| 快速完成 | 正常过渡到 completed | 正常过渡到 completed | ✅ 无影响 |
+
+**修复建议**: `single-export.tsx` 第53行的 `: ""` 改为 `: "bg-gray-500/20 text-gray-500"`，与列表组件保持一致。
+
+
