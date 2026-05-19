@@ -650,7 +650,214 @@ class IssueFilterSet(BaseFilterSet):
 
 ---
 
-## 八、完整链路示例
+## 八、字段重叠时的叠加语义分析
+
+> **新增章节**：针对同一字段在两套过滤系统同时出现的情况，提供求交规则、互斥场景分析和排查指南。
+
+当同一字段在**富过滤器（rich filters）**和**旧版扁平参数**中同时出现时，理解它们的叠加规则对于定位结果偏差至关重要。
+
+### 8.1 后端执行顺序与求交规则
+
+#### 8.1.1 执行顺序
+
+在 `IssueViewSet.list` 中，两套过滤系统按以下顺序依次应用：
+
+```python
+# 代码位置: apps/api/plane/app/views/issue/base.py:265-271
+issue_queryset = self.get_queryset()  # 基础查询
+
+# 步骤1: 应用富过滤器 (ComplexFilterBackend)
+# 解析 ?filters={"and":[{"state_id__exact":"xxx"},...]}
+issue_queryset = self.filter_queryset(issue_queryset)
+
+# 步骤2: 应用旧版过滤器 (issue_filters)
+# 解析 ?state=xxx&priority=yyy 等扁平参数
+filters = issue_filters(query_params, "GET")
+issue_queryset = issue_queryset.filter(**filters)
+```
+
+**关键结论**：两套过滤条件是**独立应用、顺序叠加**的关系，通过多次 `.filter()` 调用实现逻辑 AND。
+
+#### 8.1.2 求交规则
+
+Django QuerySet 的多次 `.filter()` 调用遵循以下规则：
+
+| 场景 | 表达式 | 实际SQL行为 |
+|------|--------|------------|
+| 同一字段等值 | `.filter(state_id=A).filter(state_id=B)` | `WHERE state_id = A AND state_id = B` → 求交（交集） |
+| 同一字段范围 | `.filter(priority__gte="high").filter(priority__lte="urgent")` | `WHERE priority >= "high" AND priority <= "urgent"` → 范围交集 |
+| 不同字段 | `.filter(state_id=A).filter(priority=B)` | `WHERE state_id = A AND priority = B` → 独立条件 |
+
+**对于重叠字段，最终结果是两套条件的严格交集**。如果条件互斥，结果将为空集。
+
+### 8.2 字段映射对照表
+
+旧版过滤器与富过滤器使用不同的字段命名体系。`LegacyToRichFiltersConverter` 中定义了映射关系：
+
+| 旧版参数名 | 富过滤器字段名 | 说明 |
+|-----------|---------------|------|
+| `state` | `state_id` | 状态ID |
+| `state_group` | `state_group` | 状态分组 |
+| `priority` | `priority` | 优先级 |
+| `assignees` | `assignee_id` | 处理人 |
+| `labels` | `label_id` | 标签 |
+| `cycle` | `cycle_id` | 迭代 |
+| `module` | `module_id` | 模块 |
+| `mentions` | `mention_id` | 提及人 |
+| `created_by` | `created_by_id` | 创建人 |
+| `project` | `project_id` | 项目 |
+| `subscriber` | `subscriber_id` | 订阅人 |
+| `start_date` | `start_date` | 开始日期 |
+| `target_date` | `target_date` | 截止日期 |
+
+> **重要提示**：旧版参数使用复数形式（如 `assignees`、`labels`），富过滤器使用单数形式（如 `assignee_id`、`label_id`）。
+
+### 8.3 典型互斥场景与结果偏差分析
+
+#### 场景1：同一字段的不同值（最常见）
+
+**请求示例**：
+```
+?filters={"and":[{"priority__exact":"high"}]}
+&priority=low
+```
+
+**执行过程**：
+1. 富过滤器生成：`Q(priority__exact="high")`
+2. 旧版过滤器生成：`{"priority__in": ["low"]}`
+3. 叠加后SQL：`WHERE priority = 'high' AND priority IN ('low')`
+
+**结果**：空集（没有issue能同时是high和low）
+
+**偏差表现**：用户看到"无结果"，但单独使用任一条件都有结果。
+
+---
+
+#### 场景2：同一字段的范围冲突
+
+**请求示例**：
+```
+?filters={"and":[{"target_date__lte":"2024-01-15"}]}
+&target_date=2024-01-20;after
+```
+
+**执行过程**：
+1. 富过滤器：`target_date <= '2024-01-15'`
+2. 旧版过滤器：`target_date >= '2024-01-20'`
+3. 叠加后：`target_date <= '2024-01-15' AND target_date >= '2024-01-20'`
+
+**结果**：空集（日期范围无交集）
+
+---
+
+#### 场景3：包含与排除的冲突
+
+**请求示例**：
+```
+?filters={"and":[{"assignee_id__in":["user1","user2"]}]}
+&assignees=None   // None在旧版中表示"未分配"
+```
+
+**执行过程**：
+1. 富过滤器：`assignee_id IN ('user1', 'user2')`
+2. 旧版过滤器解析 `None` → `assignees__isnull = True`
+3. 叠加后：`assignee_id IN (...) AND assignees__isnull = True`
+
+**结果**：空集（有处理人和无处理人互斥）
+
+---
+
+#### 场景4：多值条件的子集关系
+
+**请求示例**：
+```
+?filters={"and":[{"state_id__in":["backlog","todo","done"]}]}
+&state=backlog,todo
+```
+
+**执行过程**：
+1. 富过滤器：`state_id IN ('backlog', 'todo', 'done')`
+2. 旧版过滤器：`state__in ('backlog', 'todo')`
+3. 叠加后：`state_id IN ('backlog', 'todo', 'done') AND state__in ('backlog', 'todo')`
+
+**结果**：等价于 `state_id IN ('backlog', 'todo')`（取交集）
+
+**偏差表现**：结果比用户预期的少（缺少 `done` 状态的issue）
+
+---
+
+#### 场景5：关联表软删除的双重过滤
+
+**请求示例**：
+```
+?filters={"and":[{"assignee_id__exact":"user1"}]}
+&assignees=user1
+```
+
+**执行过程**：
+1. 富过滤器（IssueFilterSet 自定义方法）：
+   ```python
+   Q(issue_assignee__assignee_id="user1", issue_assignee__deleted_at__isnull=True)
+   ```
+2. 旧版过滤器（filter_assignees 函数）：
+   ```python
+   {
+       "assignees__in": ["user1"],
+       "issue_assignee__deleted_at__isnull": True
+   }
+   ```
+3. 叠加后：两套条件同时生效，软删除排除被应用两次（不影响结果，但增加查询复杂度）
+
+**结果**：正常，但查询性能略有下降（重复条件）
+
+### 8.4 排查指南：优先核对的参数组合
+
+当遇到结果偏差时，按以下优先级排查：
+
+#### 8.4.1 高风险参数组合（优先检查）
+
+| 优先级 | 参数名 | 风险点 | 检查方法 |
+|--------|--------|--------|---------|
+| 🔴 最高 | `state` / `state_id` | 状态值冲突 | 查看是否同时传了 `?state=` 和 `?filters` 中的 `state_id` |
+| 🔴 最高 | `priority` | 优先级值冲突 | 检查 `?priority=` 和 `filters` 中的 `priority` |
+| 🔴 最高 | `assignees` / `assignee_id` | 处理人冲突 / None值 | 注意旧版 `assignees=None` 表示未分配 |
+| 🟠 高 | `labels` / `label_id` | 标签ID冲突 | 检查多值组合的交集 |
+| 🟠 高 | `cycle` / `cycle_id` | 迭代冲突 | |
+| 🟠 高 | `module` / `module_id` | 模块冲突 | |
+| 🟡 中 | `start_date` / `target_date` | 日期范围无交集 | 检查日期的先后顺序 |
+| 🟡 中 | `created_by` / `created_by_id` | 创建人冲突 | |
+| 🟢 低 | `state_group` | 状态组冲突 | 如 `started` 与 `completed` |
+
+#### 8.4.2 后端执行顺序核对清单
+
+1. **查看基础查询**：`get_queryset()` 是否已经隐含了过滤条件
+2. **检查富过滤器**：`self.filter_queryset()` 应用了哪些条件
+3. **检查旧版过滤器**：`issue_filters()` 返回的字典包含哪些键
+4. **检查权限约束**：是否有 `filter(created_by=request.user)` 等强制条件
+5. **确认最终SQL**：`print(queryset.query)` 查看实际生成的SQL
+
+#### 8.4.3 快速定位工具
+
+在调试环境中，可以添加以下代码查看各阶段的过滤条件：
+
+```python
+# 在 IssueViewSet.list 中添加调试代码
+print("=== 过滤条件排查 ===")
+print(f"1. 富过滤器参数: {request.query_params.get('filters')}")
+print(f"2. 旧版过滤器结果: {filters}")
+print(f"3. 最终SQL WHERE: {str(issue_queryset.query)}")
+```
+
+### 8.5 规避策略
+
+1. **统一使用一套系统**：新功能优先使用富过滤器，避免混合使用
+2. **前端参数清洗**：发送请求前移除重叠的旧版参数
+3. **后端参数校验**：检测到重叠时返回警告或优先使用富过滤器
+4. **文档明确说明**：在API文档中标明字段映射关系和叠加规则
+
+---
+
+## 九、完整链路示例
 
 ### 场景：用户在UI选择"状态为待办 且 优先级为高或紧急"
 
@@ -714,53 +921,53 @@ queryset = Issue.objects.filter(
 
 ---
 
-## 九、关键设计决策
+## 十、关键设计决策
 
-### 9.1 为什么使用表达式树而不是扁平字典？
+### 10.1 为什么使用表达式树而不是扁平字典？
 - 支持复杂的逻辑组合（AND/OR/NOT嵌套）
 - 每个条件有唯一标识，便于精确更新/删除
 - 类型安全，结构清晰
 
-### 9.2 为什么需要 Adapter 层？
+### 10.2 为什么需要 Adapter 层？
 - **解耦**：前端内部结构与后端API格式独立演化
 - **兼容**：支持不同业务场景的外部格式（工作项、自动化等）
 - **转换**：处理多值逗号分隔、特殊字段映射等
 
-### 9.3 后端为什么使用 Q 对象组合？
+### 10.3 后端为什么使用 Q 对象组合？
 - **性能**：所有条件一次性生成 SQL，避免多次查询
 - **灵活**：支持任意复杂的逻辑组合
 - **安全**：通过 FilterSet 白名单验证，防止SQL注入
 
-### 9.4 自定义过滤方法 vs 标准过滤
+### 10.4 自定义过滤方法 vs 标准过滤
 - **标准过滤**：直接映射数据库字段，性能最优
 - **自定义方法**：处理软删除、权限、复杂业务逻辑
 - 统一返回 Q 对象，保持组合逻辑一致
 
 ---
 
-## 十、常见问题排查
+## 十一、常见问题排查
 
-### 10.1 过滤条件不生效？
+### 11.1 过滤条件不生效？
 1. 检查前端 `expression` 是否正确构建
 2. 检查 `toExternal` 转换后的格式是否正确
 3. 检查后端 `filters` 参数是否正确接收
 4. 查看 FilterSet 中是否声明了该字段
 
-### 10.2 多值条件只匹配第一个？
+### 11.2 多值条件只匹配第一个？
 - 确认操作符是 `__in` 而不是 `__exact`
 - 检查逗号分隔是否正确解析（`_parseFilterValue`）
 
-### 10.3 关联表过滤结果重复？
+### 11.3 关联表过滤结果重复？
 - 检查是否需要 `.distinct()`
 - 查看 FilterSet 中是否设置了 `distinct=True`
 
-### 10.4 软删除记录仍然出现？
+### 11.4 软删除记录仍然出现？
 - 确认使用了自定义过滤方法（如 `filter_assignee_id`）
 - 检查 Q 对象中是否包含 `deleted_at__isnull=True` 条件
 
 ---
 
-## 十一、代码文件索引
+## 十二、代码文件索引
 
 | 层级 | 文件路径 | 职责 |
 |------|---------|------|
@@ -774,6 +981,7 @@ queryset = Issue.objects.filter(
 | 前端查询 | `apps/web/core/store/issue/project/issue.store.ts` | 查询触发与响应处理 |
 | 后端核心 | `apps/api/plane/utils/filters/filter_backend.py` | ComplexFilterBackend |
 | 后端核心 | `apps/api/plane/utils/filters/filterset.py` | BaseFilterSet 与 Q 对象构建 |
+| 字段映射 | `apps/api/plane/utils/filters/converters.py` | LegacyToRichFiltersConverter 新旧字段映射 |
 | 旧版过滤 | `apps/api/plane/utils/issue_filters.py` | 扁平参数过滤器 |
 | 业务视图 | `apps/api/plane/app/views/issue/base.py` | IssueViewSet 过滤管线 |
 | 基类视图 | `apps/api/plane/api/views/base.py` | BaseAPIView filter_queryset |
