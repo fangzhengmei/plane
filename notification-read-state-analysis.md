@@ -141,106 +141,388 @@ EmailNotificationLog.objects.bulk_create(bulk_email_logs, batch_size=100, ignore
 
 ## 阶段三：客户端轮询与已读标记
 
-### 状态机流转
+### SWR全局配置
 
-```
-客户端挂载 → useSWR轮询 → 获取通知列表 → 本地状态更新 → 用户操作 → 标记已读/归档/延后
-```
-
-### 客户端轮询机制
-
-**轮询入口**：`apps/web/core/components/workspace-notifications/root.tsx:58-63`
+**配置定义**：`packages/constants/src/swr.ts:16-22`
 
 ```typescript
-useSWR(
-    currentWorkspace?.slug ? `WORKSPACE_NOTIFICATION_${currentWorkspace?.slug}` : null,
-    currentWorkspace?.slug
-        ? () => getNotifications(currentWorkspace?.slug, notificationMutation, notificationLoader)
-        : null
-);
-```
-
-使用 `useSWR` 进行自动轮询（默认配置），每次切换tab或过滤器时重新拉取。
-
-**服务层API**：`apps/web/core/services/workspace-notification.service.ts:34-46`
-
-```typescript
-async fetchNotifications(workspaceSlug: string, params: ...): Promise<TNotificationPaginatedInfo | undefined> {
-    return this.get(`/api/workspaces/${workspaceSlug}/users/notifications`, { params });
-}
-```
-
-### 后端列表查询
-
-**查询接口**：`apps/api/plane/app/views/notification/base.py:48-149`
-
-```python
-def list(self, request, slug):
-    # 支持的过滤参数
-    # - snoozed: true/false
-    # - archived: true/false
-    # - read: true/false/null
-    # - type: subscribed/assigned/created
-    # - mentioned: true/false
-    
-    notifications = Notification.objects.filter(
-        workspace__slug=slug, 
-        receiver_id=request.user.id
-    )
-    # 应用各种过滤器...
-```
-
-### 已读标记流程
-
-**前端操作**：`apps/web/core/store/notifications/notification.ts:194-212`
-
-```typescript
-markNotificationAsRead = async (workspaceSlug: string): Promise<TNotification | undefined> => {
-    const currentNotificationReadAt = this.read_at;
-    try {
-        // 1. 乐观更新：本地立即标记为已读
-        const payload: Partial<TNotification> = { read_at: new Date().toISOString() };
-        this.store.workspaceNotification.setUnreadNotificationsCount("decrement");
-        runInAction(() => this.mutateNotification(payload));
-        
-        // 2. 后端请求
-        const notification = await workspaceNotificationService.markNotificationAsRead(workspaceSlug, this.id);
-        
-        // 3. 后端确认后再次同步
-        if (notification) {
-            runInAction(() => this.mutateNotification(notification));
-        }
-        return notification;
-    } catch (error) {
-        // 失败回滚
-        runInAction(() => this.mutateNotification({ read_at: currentNotificationReadAt }));
-        this.store.workspaceNotification.setUnreadNotificationsCount("increment");
-        throw error;
-    }
+export const WEB_SWR_CONFIG = {
+  refreshWhenHidden: false,       // 页面隐藏时不刷新
+  revalidateIfStale: true,        // 数据过期时重新验证
+  revalidateOnFocus: true,        // 窗口获得焦点时重新验证
+  revalidateOnMount: true,        // 组件挂载时重新验证
+  errorRetryCount: 3,             // 错误重试3次
 };
 ```
 
-**后端处理**：`apps/api/plane/app/views/notification/base.py:164-169`
+**配置注入**：`apps/web/app/provider.tsx:50`
+
+```typescript
+<SWRConfig value={WEB_SWR_CONFIG}>{children}</SWRConfig>
+```
+
+---
+
+### 通知列表拉取的真实触发条件
+
+通知列表拉取共有 **6 条独立触发路径**，每条路径使用不同的 loader 类型和查询参数：
+
+#### 路径1：页面挂载（自动触发）
+
+**触发时机**：通知页面组件挂载时
+
+**代码位置**：`apps/web/core/components/workspace-notifications/root.tsx:50-63`
+
+```typescript
+// 根据本地是否已有数据决定加载模式
+const notificationMutation =
+  currentWorkspace && notificationIdsByWorkspaceId(currentWorkspace.id)
+    ? ENotificationLoader.MUTATION_LOADER      // 已有本地数据，增量加载
+    : ENotificationLoader.INIT_LOADER;          // 无本地数据，首次加载
+
+const notificationLoader =
+  currentWorkspace && notificationIdsByWorkspaceId(currentWorkspace.id)
+    ? ENotificationQueryParamType.CURRENT       // 拉取当前最新数据
+    : ENotificationQueryParamType.INIT;         // 从头开始拉取
+
+useSWR(
+  currentWorkspace?.slug ? `WORKSPACE_NOTIFICATION_${currentWorkspace?.slug}` : null,
+  currentWorkspace?.slug
+    ? () => getNotifications(currentWorkspace?.slug, notificationMutation, notificationLoader)
+    : null
+);
+```
+
+**SWR自动重验证触发条件**（由WEB_SWR_CONFIG配置）：
+- 组件首次挂载（`revalidateOnMount: true`）
+- 浏览器窗口重新获得焦点（`revalidateOnFocus: true`）
+- 缓存数据过期时（`revalidateIfStale: true`）
+
+**落库点**：无数据库写入，仅读取 `notifications` 表
+
+---
+
+#### 路径2：筛选切换（主动触发）
+
+**触发时机**：用户切换通知筛选条件时
+
+**代码位置**：`apps/web/core/store/notifications/workspace-notifications.store.ts:234-241`
+
+```typescript
+updateFilters = <T extends keyof TNotificationFilter>(key: T, value: TNotificationFilter[T]) => {
+  set(this.filters, key, value);
+  const { workspaceSlug } = this.store.router;
+  if (!workspaceSlug) return;
+
+  set(this, "notifications", {});  // 清空本地缓存
+  // 触发重新拉取，使用INIT_LOADER + INIT
+  this.getNotifications(workspaceSlug, ENotificationLoader.INIT_LOADER, ENotificationQueryParamType.INIT);
+};
+```
+
+**同样的触发模式也用于**：
+- Tab切换（ALL ↔ MENTIONS）：`setCurrentNotificationTab` L264-272
+- 批量筛选更新：`updateBulkFilters` L247-257
+
+**落库点**：无数据库写入，仅读取 `notifications` 表
+
+---
+
+#### 路径3：主动刷新（用户点击）
+
+**触发时机**：用户点击刷新按钮
+
+**代码位置**：`apps/web/core/components/workspace-notifications/sidebar/header/options/root.tsx:35-42`
+
+```typescript
+const refreshNotifications = async () => {
+  if (loader) return;  // 防重复提交
+  try {
+    // 使用MUTATION_LOADER + CURRENT，拉取最新数据但不清空缓存
+    await getNotifications(workspaceSlug, ENotificationLoader.MUTATION_LOADER, ENotificationQueryParamType.CURRENT);
+  } catch (error) {
+    console.error(error);
+  }
+};
+```
+
+**落库点**：无数据库写入，仅读取 `notifications` 表
+
+---
+
+#### 路径4：分页加载（滚动到底部）
+
+**触发时机**：用户点击"加载更多"按钮
+
+**代码位置**：`apps/web/ce/components/workspace-notifications/notification-card/root.tsx:28-34`
+
+```typescript
+const getNextNotifications = async () => {
+  try {
+    // 使用PAGINATION_LOADER + NEXT，拉取下一页数据
+    await getNotifications(workspaceSlug, ENotificationLoader.PAGINATION_LOADER, ENotificationQueryParamType.NEXT);
+  } catch (error) {
+    console.error(error);
+  }
+};
+```
+
+**分页游标逻辑**：`workspace-notifications.store.ts:180-211`
+
+```typescript
+generateNotificationQueryParams = (paramType: TNotificationQueryParamType) => {
+  const queryCursorNext =
+    paramType === ENotificationQueryParamType.INIT
+      ? `${this.paginatedCount}:0:0`                          // 从头开始
+      : paramType === ENotificationQueryParamType.CURRENT
+        ? `${this.paginatedCount}:${0}:0`                     // 拉取最新
+        : paramType === ENotificationQueryParamType.NEXT && this.paginationInfo
+          ? this.paginationInfo?.next_cursor                  // 使用后端返回的下一页游标
+          : `${this.paginatedCount}:${0}:0`;
+  // ...
+};
+```
+
+**落库点**：无数据库写入，仅读取 `notifications` 表
+
+---
+
+#### 路径5：标记全部已读
+
+**触发时机**：用户点击"全部已读"按钮
+
+**代码位置**：`apps/web/core/store/notifications/workspace-notifications.store.ts:370-401`
+
+```typescript
+markAllNotificationsAsRead = async (workspaceSlug: string): Promise<void> => {
+  try {
+    this.loader = ENotificationLoader.MARK_ALL_AS_READY;
+    const queryParams = this.generateNotificationQueryParams(ENotificationQueryParamType.INIT);
+    const params = {
+      type: queryParams.type,
+      snoozed: queryParams.snoozed,
+      archived: queryParams.archived,
+      read: queryParams.read,
+    };
+    // 后端批量更新
+    await workspaceNotificationService.markAllNotificationsAsRead(workspaceSlug, params);
+    
+    // 本地乐观更新
+    runInAction(() => {
+      update(this.unreadNotificationsCount, ..., () => 0);  // 未读数清零
+      Object.values(this.notifications).forEach((notification) =>
+        notification.mutateNotification({ read_at: new Date().toUTCString() })
+      );
+    });
+  } catch (error) {
+    console.error(error);
+    throw error;
+  } finally {
+    runInAction(() => (this.loader = undefined));
+  }
+};
+```
+
+**后端处理**：`apps/api/plane/app/views/notification/base.py:232-288`
+
+```python
+class MarkAllReadNotificationViewSet(BaseViewSet):
+    def create(self, request, slug):
+        # 根据筛选条件找出需要标记已读的通知
+        notifications = Notification.objects.filter(
+            workspace__slug=slug, 
+            receiver_id=request.user.id, 
+            read_at__isnull=True
+        )
+        # 应用筛选条件...
+        
+        # 批量更新
+        updated_notifications = []
+        for notification in notifications:
+            notification.read_at = timezone.now()
+            updated_notifications.append(notification)
+        Notification.objects.bulk_update(updated_notifications, ["read_at"], batch_size=100)
+        return Response({"message": "Successful"}, status=status.HTTP_200_OK)
+```
+
+**落库点**：`notifications` 表批量更新 `read_at` 字段（base.py:287）
+
+---
+
+### 已读状态回写时序（单条通知）
+
+#### 触发入口
+
+**用户点击通知卡片**：`apps/web/core/components/workspace-notifications/sidebar/notification-card/item.tsx:46-66`
+
+```typescript
+const handleNotificationIssuePeekOverview = async () => {
+  if (workspaceSlug && projectId && issueId && !isSnoozeStateModalOpen && !customSnoozeModal) {
+    setPeekIssue(undefined);
+    setCurrentSelectedNotificationId(notificationId);
+
+    // 仅当未读时才触发已读标记
+    if (notification.read_at === null) {
+      try {
+        await markNotificationAsRead(workspaceSlug);
+      } catch (error) {
+        console.error(error);
+      }
+    }
+    // ...
+  }
+};
+```
+
+---
+
+#### 时序图（乐观更新模式）
+
+```
+用户点击通知卡片
+       ↓
+[前端] markNotificationAsRead() 开始
+       ├─ 保存当前 read_at 值用于回滚
+       ├─ 乐观更新1：未读数 -1 (setUnreadNotificationsCount("decrement"))
+       ├─ 乐观更新2：本地状态 read_at = 当前时间 (mutateNotification)
+       ├─ 发送 POST /api/workspaces/{slug}/users/notifications/{id}/read/
+       │    ↓
+       │  [后端] mark_read() 处理
+       │    ├─ 查询 Notification 表验证权限
+       │    ├─ notification.read_at = timezone.now()
+       │    ├─ notification.save()  ← 落库点
+       │    └─ 返回更新后的通知数据
+       │
+       ├─ 后端返回成功
+       │    └─ 同步后端返回的 read_at 时间（覆盖乐观更新值）
+       └─ 完成
+            ↓
+       （如失败）
+            ├─ 回滚1：未读数 +1 (setUnreadNotificationsCount("increment"))
+            ├─ 回滚2：恢复原始 read_at 值
+            └─ 抛出异常
+```
+
+---
+
+#### 详细代码分析
+
+**前端Store层**：`apps/web/core/store/notifications/notification.ts:194-212`
+
+```typescript
+markNotificationAsRead = async (workspaceSlug: string): Promise<TNotification | undefined> => {
+  const currentNotificationReadAt = this.read_at;  // 保存原始值用于回滚
+  try {
+    // ========== 乐观更新阶段 ==========
+    const payload: Partial<TNotification> = { read_at: new Date().toISOString() };
+    this.store.workspaceNotification.setUnreadNotificationsCount("decrement");  // 未读数-1
+    runInAction(() => this.mutateNotification(payload));  // 本地立即标记为已读
+    
+    // ========== 后端请求阶段 ==========
+    const notification = await workspaceNotificationService.markNotificationAsRead(workspaceSlug, this.id);
+    
+    // ========== 后端确认阶段 ==========
+    if (notification) {
+      runInAction(() => this.mutateNotification(notification));  // 用后端返回值覆盖
+    }
+    return notification;
+  } catch (error) {
+    // ========== 失败回滚阶段 ==========
+    runInAction(() => this.mutateNotification({ read_at: currentNotificationReadAt }));  // 恢复原始值
+    this.store.workspaceNotification.setUnreadNotificationsCount("increment");  // 未读数+1
+    throw error;
+  }
+};
+```
+
+**后端API层**：`apps/api/plane/app/views/notification/base.py:164-169`
 
 ```python
 def mark_read(self, request, slug, pk):
+    # 权限校验：只能标记自己收到的通知
     notification = Notification.objects.get(receiver=request.user, workspace__slug=slug, pk=pk)
-    notification.read_at = timezone.now()  # 关键状态变更点
-    notification.save()
+    notification.read_at = timezone.now()  # 关键状态变更
+    notification.save()  # 落库点
+    serializer = NotificationSerializer(notification)
     return Response(serializer.data, status=status.HTTP_200_OK)
 ```
 
+**服务层API**：`apps/web/core/services/workspace-notification.service.ts:64-71`
+
+```typescript
+async markNotificationAsRead(workspaceSlug: string, notificationId: string): Promise<TNotification | undefined> {
+  try {
+    const { data } = await this.post(
+      `/api/workspaces/${workspaceSlug}/users/notifications/${notificationId}/read/`
+    );
+    return data || undefined;
+  } catch (error) {
+    throw error;
+  }
+}
+```
+
+---
+
+#### 其他状态操作的回写时序（模式一致）
+
+所有状态操作（未读、归档、延后）都遵循相同的乐观更新模式：
+
+| 操作 | 状态字段 | 前端乐观更新 | 后端落库点 | 失败回滚 |
+|-----|---------|------------|-----------|---------|
+| 标记已读 | `read_at` | 设为当前时间 | base.py:166 | 恢复原值，未读数+1 |
+| 标记未读 | `read_at` | 设为 `undefined` | base.py:174 | 恢复原值，未读数-1 |
+| 归档 | `archived_at` | 设为当前时间 | base.py:182 | 恢复原值 |
+| 取消归档 | `archived_at` | 设为 `undefined` | base.py:190 | 恢复原值 |
+| 延后 | `snoozed_till` | 设为目标时间 | base.py:156 | 恢复原值 |
+| 取消延后 | `snoozed_till` | 设为 `undefined` | base.py:156 | 恢复原值 |
+
+**代码示例（归档）**：`notification.ts:244-259`
+
+```typescript
+archiveNotification = async (workspaceSlug: string): Promise<TNotification | undefined> => {
+  const currentNotificationArchivedAt = this.archived_at;
+  try {
+    const payload: Partial<TNotification> = { archived_at: new Date().toISOString() };
+    runInAction(() => this.mutateNotification(payload));  // 乐观更新
+    const notification = await workspaceNotificationService.markNotificationAsArchived(workspaceSlug, this.id);
+    if (notification) {
+      runInAction(() => this.mutateNotification(notification));
+    }
+    return notification;
+  } catch (error) {
+    runInAction(() => this.mutateNotification({ archived_at: currentNotificationArchivedAt }));  // 回滚
+    throw error;
+  }
+};
+```
+
+---
+
+### 拉取路径汇总表
+
+| 路径 | 触发源 | Loader类型 | QueryParam类型 | 清空缓存 | 落库操作 |
+|-----|-------|-----------|---------------|---------|---------|
+| 页面挂载 | useSWR自动 | INIT_LOADER / MUTATION_LOADER | INIT / CURRENT | 否 | 读 |
+| 筛选切换 | updateFilters | INIT_LOADER | INIT | 是 | 读 |
+| Tab切换 | setCurrentNotificationTab | INIT_LOADER | INIT | 是 | 读 |
+| 主动刷新 | 刷新按钮 | MUTATION_LOADER | CURRENT | 否 | 读 |
+| 分页加载 | 加载更多 | PAGINATION_LOADER | NEXT | 否 | 读 |
+| 全部已读 | 全部已读按钮 | MARK_ALL_AS_READY | - | 否 | 批量更新read_at |
+
+---
+
 ### 状态字段变更矩阵
 
-| 操作 | 字段变更 | 代码位置 |
-|-----|---------|---------|
-| 标记已读 | `read_at = now()` | base.py:166 |
-| 标记未读 | `read_at = None` | base.py:174 |
-| 归档 | `archived_at = now()` | base.py:182 |
-| 取消归档 | `archived_at = None` | base.py:190 |
-| 延后 | `snoozed_till = date` | base.py:156 |
-| 取消延后 | `snoozed_till = None` | base.py:156 |
-| 全部已读 | 批量更新 `read_at = now()` | base.py:285 |
+| 操作 | 字段变更 | 代码位置 | 落库表 |
+|-----|---------|---------|-------|
+| 标记已读 | `read_at = now()` | base.py:166 | notifications |
+| 标记未读 | `read_at = None` | base.py:174 | notifications |
+| 归档 | `archived_at = now()` | base.py:182 | notifications |
+| 取消归档 | `archived_at = None` | base.py:190 | notifications |
+| 延后 | `snoozed_till = date` | base.py:156 | notifications |
+| 取消延后 | `snoozed_till = None` | base.py:156 | notifications |
+| 全部已读 | 批量更新 `read_at = now()` | base.py:287 | notifications |
 
 ---
 
@@ -272,13 +554,23 @@ def mark_read(self, request, slug, pk):
 ┌───────────────────────────────────▼─────────────────────────────────────────────┐
 │                            客户端轮询与已读阶段 (前后端)                          │
 ├─────────────────────────────────────────────────────────────────────────────────┤
-│  前端挂载 → useSWR自动轮询 → GET /api/workspaces/{slug}/users/notifications     │
-│                    ↓                                                           │
-│          本地MobX状态更新（WorkspaceNotificationStore）                          │
-│                    ↓                                                           │
-│          用户点击已读 → 乐观更新(read_at=now) → POST /read/ → 后端确认           │
-│                    ↓                                                           │
-│          数据库更新: notifications.read_at = timezone.now()                     │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                           通知列表拉取路径                                 │  │
+│  ├───────────────────────────────────────────────────────────────────────────┤  │
+│  │  1. 页面挂载: useSWR自动 → GET /notifications → MobX状态更新               │  │
+│  │  2. 筛选切换: updateFilters → 清空缓存 → GET /notifications                 │  │
+│  │  3. 主动刷新: 刷新按钮 → GET /notifications (CURRENT模式)                   │  │
+│  │  4. 分页加载: 加载更多 → GET /notifications (NEXT游标)                      │  │
+│  │  5. 全部已读: 全部已读按钮 → POST /mark-all-read/ → 批量更新read_at          │  │
+│  └───────────────────────────────────┬───────────────────────────────────────┘  │
+│                                      │                                          │
+│  ┌───────────────────────────────────▼───────────────────────────────────────┐  │
+│  │                           已读状态回写时序                                 │  │
+│  ├───────────────────────────────────────────────────────────────────────────┤  │
+│  │  用户点击通知 → 乐观更新(read_at=now) → POST /read/ → 后端save() → 同步状态 │  │
+│  │                                      ↓(失败)                               │  │
+│  │                                回滚原始状态                                 │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -288,6 +580,9 @@ def mark_read(self, request, slug, pk):
 
 1. **异步处理**：通知生成通过Celery异步任务处理，不阻塞主流程
 2. **批量操作**：使用 `bulk_create` 和 `bulk_update` 提高数据库性能
-3. **乐观更新**：前端已读操作先本地更新，后端确认失败时回滚
+3. **乐观更新**：前端已读操作先本地更新，后端确认失败时回滚，提升用户体验
 4. **多级过滤**：订阅者→用户偏好→活动类型，三级过滤确保通知相关性
 5. **状态分离**：`read_at`/`snoozed_till`/`archived_at` 三个时间戳字段独立控制通知状态
+6. **SWR自动重验证**：利用SWR的revalidateOnFocus/revalidateOnMount特性实现静默刷新
+7. **防重复提交**：所有用户操作都通过 `loader` 状态防止重复请求
+8. **游标分页**：使用游标模式而非页码分页，提升大数据量下的查询性能
