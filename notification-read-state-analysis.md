@@ -991,6 +991,318 @@ export const WEB_SWR_CONFIG = {
 
 ---
 
+## 异常路径分析：通知拉取失败分支时序
+
+### 失败传播链路
+
+通知拉取流程的失败传播遵循 **"早期失败、快速中断"** 原则：
+
+```
+getNotifications() 调用
+       ↓
+[try 块开始]
+       ↓
+      生成查询参数
+       ↓
+      await getUnreadNotificationsCount(workspaceSlug)
+       │    ↓
+       │    try {
+       │      await fetchUnreadNotificationsCount()  ← 失败点1：网络/后端错误
+       │    } catch (error) {
+       │      console.error(error)
+       │      throw error  ← 向上抛出！
+       │    }
+       │
+       ├─ 失败：异常冒泡到外层 catch
+       │    ├─ console.error("getNotifications -> error", error)
+       │    ├─ throw error
+       │    └─ finally 块：loader = undefined
+       │
+       └─ 成功：继续执行
+            ↓
+           await fetchNotifications()  ← 失败点2：网络/后端错误
+            ↓
+           更新本地状态
+```
+
+**关键代码证据**：`workspace-notifications.store.ts:317-363`
+
+```typescript
+getUnreadNotificationsCount = async (workspaceSlug) => {
+  try {
+    const unreadNotificationCount = await workspaceNotificationService.fetchUnreadNotificationsCount(workspaceSlug);
+    if (unreadNotificationCount)
+      runInAction(() => {
+        set(this, "unreadNotificationsCount", unreadNotificationCount);
+      });
+    return unreadNotificationCount || undefined;
+  } catch (error) {
+    console.error("WorkspaceNotificationStore -> getUnreadNotificationsCount -> error", error);
+    throw error;  // ← 关键：重新抛出异常，中断后续流程
+  }
+};
+
+getNotifications = async (workspaceSlug, loader, queryParamType) => {
+  this.loader = loader;
+  try {
+    const queryParams = this.generateNotificationQueryParams(queryParamType);
+    await this.getUnreadNotificationsCount(workspaceSlug);  // ← 如果这里抛出...
+    const notificationResponse = await workspaceNotificationService.fetchNotifications(workspaceSlug, queryParams);  // ← ...这行永远不会执行！
+    // 更新本地状态...
+  } catch (error) {
+    console.error("WorkspaceNotificationStore -> getNotifications -> error", error);
+    throw error;
+  } finally {
+    runInAction(() => (this.loader = undefined));  // ← 但 finally 总会执行
+  }
+};
+```
+
+**核心结论**：未读计数请求失败时，**通知列表请求永远不会被发起**，因为 `await` 抛出异常会直接跳转到 catch 块。
+
+---
+
+### 失败时的页面可见状态
+
+失败时页面的最终状态取决于 **失败发生的时机** 和 **之前是否有缓存数据**。
+
+#### 场景1：首次加载（INIT_LOADER）失败
+
+**时序**：
+```
+T0: 用户打开通知页面
+T1: getNotifications(INIT_LOADER) 调用
+T2: this.loader = "init-loader"
+T3: GET /unread/ → 失败（网络错误/500）
+T4: 异常抛出，跳过 GET /notifications/
+T5: finally 执行：this.loader = undefined
+T6: 组件渲染
+```
+
+**代码位置**：`sidebar/root.tsx:102-118`
+
+```typescript
+{loader === "init-loader" ? (
+  <div className="relative h-full w-full overflow-hidden">
+    <NotificationsLoader />  {/* 骨架屏 */}
+  </div>
+) : (
+  <>
+    {notificationIds && notificationIds.length > 0 ? (
+      <ContentWrapper>
+        <NotificationListRoot />
+      </ContentWrapper>
+    ) : (
+      <div className="relative flex h-full w-full items-center justify-center">
+        <NotificationEmptyState />  {/* 空状态 */}
+      </div>
+    )}
+  </>
+)}
+```
+
+**可见状态**：
+- **骨架屏消失**：`loader` 已被 `finally` 清空为 `undefined`
+- **显示空状态**：`notificationIds` 为 `undefined`（从未获取到数据）
+- **无错误提示**：代码中没有错误边界或错误提示UI
+- **未读计数显示0**：`unreadNotificationsCount` 保持默认值（空对象，Tab计数为0）
+
+**用户体验**：用户看到一个空的通知收件箱，但不知道是真的没有通知还是加载失败了。
+
+---
+
+#### 场景2：已有缓存时的刷新（MUTATION_LOADER）失败
+
+**时序**：
+```
+T0: 本地已有缓存数据（notificationIds = [id1, id2, id3]）
+T1: 用户点击刷新按钮
+T2: getNotifications(MUTATION_LOADER) 调用
+T3: this.loader = "mutation-loader"
+T4: GET /unread/ → 失败
+T5: 异常抛出，跳过 GET /notifications/
+T6: finally 执行：this.loader = undefined
+T7: 组件渲染
+```
+
+**可见状态**：
+- **刷新图标停止旋转**：`loader` 已清空
+- **显示旧的缓存列表**：`notificationIds` 保持原有值，未被修改
+- **未读计数保持旧值**：`unreadNotificationsCount` 未被更新
+- **无视觉反馈**：用户不知道刷新失败了
+
+**代码位置**：`sidebar/header/options/root.tsx:73-74`
+
+```typescript
+className={loader === ENotificationLoader.MUTATION_LOADER ? "animate-spin" : ""}
+```
+
+---
+
+#### 场景3：分页加载（PAGINATION_LOADER）失败
+
+**时序**：
+```
+T0: 已有第一页数据，paginationInfo.next_page_results = true
+T1: 用户点击"加载更多"
+T2: getNotifications(PAGINATION_LOADER) 调用
+T3: this.loader = "pagination-loader"
+T4: GET /unread/ → 失败
+T5: 异常抛出，跳过 GET /notifications/
+T6: finally 执行：this.loader = undefined
+T7: 组件渲染
+```
+
+**代码位置**：`notification-card/root.tsx:44-56`
+
+```typescript
+{paginationInfo && paginationInfo?.next_page_results && (
+  <>
+    {loader === ENotificationLoader.PAGINATION_LOADER ? (
+      <div className="flex items-center justify-center py-4 text-13 font-medium">
+        <div className="text-accent-secondary">{t("loading")}...</div>
+      </div>
+    ) : (
+      <div className="flex items-center justify-center py-4 text-13 font-medium" onClick={getNextNotifications}>
+        <div className="cursor-pointer text-accent-secondary transition-all hover:text-accent-primary">
+          {t("load_more")}
+        </div>
+      </div>
+    )}
+  </>
+)}
+```
+
+**可见状态**：
+- **"loading..." 消失**：`loader` 已清空
+- **恢复显示"加载更多"按钮**：用户可以再次点击
+- **原有数据保持不变**：不影响已加载的通知列表
+
+---
+
+### Loader 状态收敛机制
+
+所有异步操作都通过 `finally` 块确保 loader 状态最终收敛：
+
+```typescript
+try {
+  // 异步操作...
+} catch (error) {
+  // 错误处理...
+} finally {
+  runInAction(() => (this.loader = undefined));  // ← 无论成功失败，总会执行
+}
+```
+
+**Loader 状态生命周期**：
+
+| 阶段 | loader 值 | 持续时间 |
+|-----|----------|---------|
+| 操作开始 | `INIT_LOADER` / `MUTATION_LOADER` / `PAGINATION_LOADER` / `MARK_ALL_AS_READY` | 异步请求期间 |
+| 操作结束（成功/失败） | `undefined` | 永久（直到下一次操作） |
+
+**关键保证**：即使请求失败，loader 也不会卡住，用户可以继续进行其他操作。
+
+---
+
+### 失败后的恢复机制
+
+失败后系统通过 **多层重试/重验证机制** 自动恢复：
+
+#### 机制1：SWR 自动重试（仅适用于 useSWR 触发的拉取）
+
+**代码位置**：`packages/constants/src/swr.ts:21`
+
+```typescript
+export const WEB_SWR_CONFIG = {
+  errorRetryCount: 3,  // ← 失败后自动重试3次
+};
+```
+
+**适用场景**：页面挂载触发的 `useSWR` 调用（`root.tsx:58-63`）
+
+**重试逻辑**：
+- 第1次失败 → 等待指数退避时间 → 第2次尝试
+- 第2次失败 → 等待更长时间 → 第3次尝试
+- 第3次失败 → 停止重试，等待用户交互或其他触发
+
+> **注意**：`errorRetryCount` 仅适用于 SWR 管理的请求。用户手动触发的刷新、筛选切换、分页加载**不会自动重试**。
+
+---
+
+#### 机制2：SWR 自动重验证
+
+即使重试全部失败，以下事件会触发重新拉取：
+
+| 触发事件 | 代码位置 | 说明 |
+|---------|---------|------|
+| 窗口获得焦点 | `revalidateOnFocus: true` | 用户切换回浏览器标签页时自动重拉 |
+| 组件重新挂载 | `revalidateOnMount: true` | 用户重新进入通知页面时 |
+| 缓存过期 | `revalidateIfStale: true` | SWR 认为缓存过期时 |
+
+**代码位置**：`packages/constants/src/swr.ts:17-20`
+
+```typescript
+export const WEB_SWR_CONFIG = {
+  refreshWhenHidden: false,
+  revalidateIfStale: true,
+  revalidateOnFocus: true,
+  revalidateOnMount: true,
+  errorRetryCount: 3,
+};
+```
+
+---
+
+#### 机制3：用户主动操作
+
+用户可以通过以下操作触发重新拉取：
+
+1. **点击刷新按钮**：`refreshNotifications` 函数（`options/root.tsx:35-42`）
+2. **切换筛选条件**：`updateFilters` 会清空缓存并重新拉取（`workspace-notifications.store.ts:234-241`）
+3. **切换 Tab**：`setCurrentNotificationTab` 会触发重新拉取（`workspace-notifications.store.ts:264-272`）
+4. **点击"加载更多"**：分页加载失败后，按钮恢复可点击状态（`notification-card/root.tsx:51-56`）
+
+---
+
+#### 机制4：乐观更新的回滚保护
+
+对于单条操作（标记已读/未读/归档/延后），失败时有完整的回滚机制：
+
+```typescript
+markNotificationAsRead = async (workspaceSlug) => {
+  const currentNotificationReadAt = this.read_at;  // 保存原始值
+  try {
+    // 乐观更新...
+    const notification = await workspaceNotificationService.markNotificationAsRead(workspaceSlug, this.id);
+    // 成功处理...
+  } catch (error) {
+    // ========== 完整回滚 ==========
+    runInAction(() => this.mutateNotification({ read_at: currentNotificationReadAt }));
+    this.store.workspaceNotification.setUnreadNotificationsCount("increment");
+    throw error;
+  }
+};
+```
+
+**回滚保证**：单条操作失败时，本地状态会完全恢复到操作前的状态，不会出现不一致。
+
+---
+
+### 失败路径汇总表
+
+| 失败场景 | 触发源 | 未读计数请求 | 列表请求 | 页面状态 | 自动恢复 |
+|---------|-------|------------|---------|---------|---------|
+| 首次加载失败 | useSWR | ✗ 失败 | ✗ 不发起 | 显示空状态 | ✓ SWR重试3次 |
+| 刷新失败 | 刷新按钮 | ✗ 失败 | ✗ 不发起 | 保持旧数据 | ✗ 无自动重试 |
+| 筛选切换失败 | updateFilters | ✗ 失败 | ✗ 不发起 | 空状态（缓存已清空） | ✗ 无自动重试 |
+| Tab切换失败 | setCurrentNotificationTab | ✗ 失败 | ✗ 不发起 | 空状态（缓存已清空） | ✗ 无自动重试 |
+| 分页加载失败 | 加载更多 | ✗ 失败 | ✗ 不发起 | 保持已有数据，按钮可重点击 | ✗ 无自动重试 |
+| 单条操作失败 | 点击通知卡片 | - | - | 回滚到操作前状态 | ✓ 完整回滚 |
+| 全部已读失败 | 全部已读按钮 | - | - | 无回滚，状态不确定 | ✗ 无回滚 |
+
+---
+
 ### 状态字段变更矩阵
 
 | 操作 | 字段变更 | 代码位置 | 落库表 | 模式 |
@@ -1086,3 +1398,10 @@ export const WEB_SWR_CONFIG = {
     - 允许短暂的计数与列表不一致，通过多层纠正机制最终收敛
     - 牺牲强一致性换取更好的用户体验（乐观更新无等待）
 12. **串行请求保证**：未读计数与通知列表请求串行执行（`await` 关键字），确保计数先更新
+13. **早期失败策略**：未读计数请求失败时快速中断，不发起后续列表请求
+14. **Loader 收敛保证**：所有异步操作通过 `finally` 块确保 loader 状态最终清空，避免界面卡死
+15. **分层错误处理**：
+    - SWR 管理的请求：自动重试3次 + 自动重验证
+    - 用户手动触发的请求：无自动重试，依赖用户主动操作
+    - 单条操作：完整回滚保护
+    - 批量操作：无回滚，依赖后续拉取纠正
