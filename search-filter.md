@@ -1002,19 +1002,162 @@ filtered_issue_queryset = filtered_issue_queryset.filter(created_by=request.user
 
 > ⚠️ **注意**：`filtered_issue_queryset` 在拷贝后也被应用了权限约束，所以实际上统计结果是准确的。但如果代码版本不同，可能存在不一致。
 
-### 9.4 排查时的端点判断方法
+### 9.4 端点路由识别
 
-当遇到过滤结果偏差时，首先确定调用的是哪个端点：
+根据 Django URL 配置（`apps/api/plane/app/urls/issue.py`），issues 相关接口的路由与视图类对应关系如下：
 
-| 端点特征 | 判定方法 | 排查侧重点 |
-|---------|---------|-----------|
-| **list 端点** | URL 为 `/api/v1/workspaces/{slug}/projects/{pid}/issues/` | 检查权限是否在最后过滤掉了结果 |
-| **detail 列表端点** | URL 为 `/api/v1/workspaces/{slug}/projects/{pid}/issues/` 但使用 `IssueDetailEndpoint` | 检查权限子查询是否在最前面排除了数据 |
-| **单个详情** | URL 包含 `issue_id` 或 `issue_identifier` | 通常不涉及过滤条件叠加，主要检查权限 |
+#### 9.4.1 路由-视图类对照表
 
-**快速判断调用的类**：在 `base.py` 中搜索 URL 路径对应的 `as_view()` 调用，或查看 Django 的 URL 配置。
+| URL 路径 | HTTP 方法 | 视图类 | 说明 |
+|---------|----------|--------|------|
+| `/api/v1/workspaces/{slug}/projects/{pid}/issues/` | GET, POST | `IssueViewSet` | **标准列表接口**，返回分页结果 |
+| `/api/v1/workspaces/{slug}/projects/{pid}/issues/list/` | GET | `IssueListEndpoint` | 列表接口（v1） |
+| `/api/v1/workspaces/{slug}/projects/{pid}/issues-detail/` | GET | `IssueDetailEndpoint` | **详情列表接口**，返回带展开字段的完整数据 |
+| `/api/v1/workspaces/{slug}/projects/{pid}/v2/issues/` | GET | `IssuePaginatedViewSet` | 分页接口（v2） |
+| `/api/v1/workspaces/{slug}/projects/{pid}/issues/{issue_id}/` | GET, PUT, PATCH, DELETE | `IssueViewSet` | 单个 issue 详情/更新/删除 |
+| `/api/v1/workspaces/{slug}/work-items/{pid}-{iid}/` | GET | `IssueDetailIdentifierEndpoint` | 通过标识符访问单个 issue |
 
-### 9.5 调试建议
+**关键区分**：
+- ✅ `.../issues/`（不带 detail）→ `IssueViewSet.list`
+- ✅ `.../issues-detail/` → `IssueDetailEndpoint.get`
+- ✅ `.../issues/{id}/` → `IssueViewSet.retrieve`（单个，无过滤叠加问题）
+
+#### 9.4.2 排查时的端点判断方法
+
+当遇到过滤结果偏差时，按以下步骤确定端点：
+
+**步骤1：从 URL 路径判断**
+```
+URL 包含 "/issues-detail/" → IssueDetailEndpoint（权限在最前）
+URL 是 "/issues/" 且无后续 ID → IssueViewSet.list（权限在最后）
+URL 包含 "/issues/{uuid}/" → IssueViewSet.retrieve（单个，无过滤叠加）
+```
+
+**步骤2：从返回结构判断**
+- `IssueViewSet.list`：标准分页结构 `{ count, next, previous, results }`
+- `IssueDetailEndpoint.get`：同样返回分页，但每个 result 包含更多展开字段
+- 单个详情：直接返回 issue 对象，无分页
+
+**步骤3：确认视图类（调试时）**
+在 `base.py` 中添加临时调试代码：
+```python
+# 在方法开头添加
+print(f"当前视图类: {self.__class__.__name__}")
+```
+
+#### 9.4.3 两条核心链路的过滤执行对比
+
+| 维度 | `IssueViewSet.list` | `IssueDetailEndpoint.get` |
+|------|---------------------|---------------------------|
+| **路由** | `.../issues/` | `.../issues-detail/` |
+| **权限时机** | 最后（过滤后） | 最前（基础查询中） |
+| **权限实现** | `.filter(created_by=user)` | `EXISTS` 子查询 |
+| **执行顺序** | 基础 → 富 → 旧版 → 权限 | 基础+权限 → 富 → 旧版 |
+| **权限优先级** | 最高（最后叠加） | 最高（最前过滤） |
+| **典型场景** | 列表页、看板、表格 | 详情展开视图、卡片详情 |
+
+### 9.5 排查步骤：先判路由，再判顺序
+
+**标准排查流程图**：
+
+```
+发现结果偏差
+    ↓
+【第一步：判定路由】
+    ↓
+    ├─→ URL 是 /issues/ 吗？ ──是──→ IssueViewSet.list 链路
+    │                                   ↓
+    │                            检查顺序：
+    │                            1. 富过滤器
+    │                            2. 旧版过滤器
+    │                            3. 权限约束（最后）
+    │
+    ├─→ URL 是 /issues-detail/ 吗？ ──是──→ IssueDetailEndpoint 链路
+    │                                           ↓
+    │                                     检查顺序：
+    │                                     1. 权限约束（最前）
+    │                                     2. 富过滤器
+    │                                     3. 旧版过滤器
+    │
+    └─→ URL 含 issue_id 吗？ ──是──→ 单个详情，无过滤叠加
+                                           ↓
+                                     检查权限、软删除即可
+    ↓
+【第二步：按顺序排查每一层】
+    ↓
+    对每一层过滤：
+    - 查看该层输入的参数
+    - 查看该层输出的 QuerySet count()
+    - 对比预期数量
+    ↓
+【第三步：确认重叠字段】
+    ↓
+    检查同一字段是否在多个过滤层中出现：
+    - rich filters 中是否有 state_id/priority/assignee_id？
+    - 旧版参数中是否有 state/priority/assignees？
+    - 权限约束是否涉及 created_by？
+    ↓
+【第四步：定位冲突点】
+    ↓
+    找到导致结果偏差的具体过滤条件组合
+```
+
+#### 9.5.1 IssueViewSet.list 排查清单
+
+```
+□ 检查富过滤器参数: request.query_params.get("filters")
+   → 解析后包含哪些条件？
+   
+□ 检查旧版过滤器结果: issue_filters(query_params, "GET")
+   → 返回字典包含哪些键？
+   
+□ 检查权限条件:
+   → 用户是访客吗？(role=5)
+   → project.guest_view_all_features 是 True 吗？
+   → 是否应用了 .filter(created_by=request.user)？
+   
+□ 逐阶段计数:
+   → 基础查询数量: self.get_queryset().count()
+   → 富过滤器后数量: self.filter_queryset(...).count()
+   → 旧版过滤器后数量: .filter(**filters).count()
+   → 权限约束后数量: .filter(created_by=user).count()
+```
+
+#### 9.5.2 IssueDetailEndpoint.get 排查清单
+
+```
+□ 检查权限子查询:
+   → 用户角色是什么？(admin/member/guest)
+   → project.guest_view_all_features 是 True 吗？
+   → 权限子查询排除了哪些数据？
+   
+□ 检查富过滤器参数: request.query_params.get("filters")
+   → 在权限过滤后的基础上进一步缩小范围？
+   
+□ 检查旧版过滤器结果: issue_filters(request.query_params, "GET")
+   → 是否在最后添加了额外约束？
+   
+□ 逐阶段计数:
+   → 权限后数量: .filter(Exists(permission_subquery)).count()
+   → 富过滤器后数量: self.filter_queryset(...).count()
+   → 旧版过滤器后数量: .filter(**filters).count()
+```
+
+#### 9.5.3 常见重叠字段快速检查表
+
+| 字段组 | 富过滤器键 | 旧版参数键 | 权限相关 | 可能的冲突 |
+|--------|-----------|-----------|----------|-----------|
+| 创建人 | `created_by_id` | `created_by` | `created_by=user` | 🔴 高风险 |
+| 处理人 | `assignee_id` | `assignees` | - | 🟠 中风险 |
+| 状态 | `state_id` | `state` | - | 🟠 中风险 |
+| 优先级 | `priority` | `priority` | - | 🟠 中风险 |
+| 标签 | `label_id` | `labels` | - | 🟡 低风险 |
+| 迭代 | `cycle_id` | `cycle` | - | 🟡 低风险 |
+| 模块 | `module_id` | `module` | - | 🟡 低风险 |
+
+> 💡 **排查技巧**：先检查高风险字段组（创建人、处理人、状态、优先级），它们占重叠问题的 80% 以上。
+
+### 9.6 调试建议
 
 #### 针对 list 端点：
 ```python
