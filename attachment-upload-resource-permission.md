@@ -335,80 +335,245 @@ issue_attachment = FileAsset.objects.get(pk=pk, workspace__slug=slug, project_id
 
 ---
 
-## 6. Project/Workspace Download 端点绕过分析
+## 6. 通用资产端点的可变更边界
 
-### 6.1 `WorkspaceAssetDownloadEndpoint`
+除了工单专属的 `IssueAttachmentV2Endpoint` 和 `IssueAttachmentDetailAPIEndpoint`，Plane 还提供了四个通用资产端点，它们的查询条件不区分 `entity_type`，对 `ISSUE_ATTACHMENT` 类型的资产同样可操作。这些端点构成了一条与 issue URL 平行的附件访问和变更路径。
+
+### 6.1 `WorkspaceFileAssetEndpoint`
+
+代码：`apps/api/plane/app/views/asset/v2.py`
+
+**确认上传（PATCH）**
+
+```python
+@allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+def patch(self, request, slug, asset_id):
+    asset = FileAsset.objects.get(id=asset_id, workspace__slug=slug)
+    asset.is_uploaded = True
+    # ...
+    self.entity_asset_save(asset_id=asset_id, entity_type=asset.entity_type, asset=asset, request=request)
+    asset.save(update_fields=["is_uploaded", "attributes"])
+```
+
+- 查询条件：`id=asset_id, workspace__slug=slug` — **不含 `entity_type`、`project_id`、`issue_id`**
+- 权限级别：WORKSPACE，工作区成员即可
+- 影响：工作区成员可确认上传同工作区内**任意项目**的 `ISSUE_ATTACHMENT` 资产，包括非成员项目
+
+**删除（DELETE）**
+
+```python
+@allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+def delete(self, request, slug, asset_id):
+    asset = FileAsset.objects.get(id=asset_id, workspace__slug=slug)
+    asset.is_deleted = True
+    asset.deleted_at = timezone.now()
+    self.entity_asset_delete(entity_type=asset.entity_type, asset=asset, request=request)
+    asset.save(update_fields=["is_deleted", "deleted_at"])
+```
+
+- 查询条件：`id=asset_id, workspace__slug=slug` — **不含 `entity_type`、`project_id`、`issue_id`**
+- 权限级别：WORKSPACE
+- `entity_asset_delete` 副作用：仅处理 `WORKSPACE_LOGO` 和 `PROJECT_COVER` 类型，对 `ISSUE_ATTACHMENT` 无额外副作用
+- 影响：工作区成员可软删除同工作区内**任意项目**的 `ISSUE_ATTACHMENT` 资产，包括非成员项目
+
+**下载（GET）**
+
+```python
+@allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+def get(self, request, slug, asset_id):
+    asset = FileAsset.objects.get(id=asset_id, workspace__slug=slug)
+    if not asset.is_uploaded:
+        return Response({"error": "..."}, status=status.HTTP_404_NOT_FOUND)
+    # 生成签名 URL 并 302 重定向
+```
+
+- 查询条件：`id=asset_id, workspace__slug=slug` — **不含 `entity_type`、`project_id`、`issue_id`**
+- `is_uploaded` 校验：✅ 存在
+- 影响：工作区成员可下载同工作区内**任意项目**的 `ISSUE_ATTACHMENT`，无需是项目成员
+
+### 6.2 `ProjectAssetEndpoint`
+
+代码：`apps/api/plane/app/views/asset/v2.py`
+
+**确认上传（PATCH）**
+
+```python
+@allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST])
+def patch(self, request, slug, project_id, pk):
+    asset = FileAsset.objects.get(id=pk, workspace__slug=slug, project_id=project_id)
+    asset.is_uploaded = True
+    # ...
+    asset.save(update_fields=["is_uploaded", "attributes"])
+```
+
+- 查询条件：`id=pk, workspace__slug=slug, project_id=project_id` — **不含 `entity_type`、`issue_id`**
+- 权限级别：PROJECT，项目成员即可
+- 影响：项目成员可确认上传同项目内**任意 issue** 的 `ISSUE_ATTACHMENT` 资产
+- 注意：与 `WorkspaceFileAssetEndpoint` 不同，此端点的 PATCH **不调用** `entity_asset_save`，不会触发封面/Logo 更新副作用
+
+**删除（DELETE）**
+
+```python
+@allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST])
+def delete(self, request, slug, project_id, pk):
+    asset = FileAsset.objects.get(id=pk, workspace__slug=slug, project_id=project_id)
+    asset.is_deleted = True
+    asset.deleted_at = timezone.now()
+    asset.save(update_fields=["is_deleted", "deleted_at"])
+```
+
+- 查询条件：`id=pk, workspace__slug=slug, project_id=project_id` — **不含 `entity_type`、`issue_id`**
+- 权限级别：PROJECT
+- `entity_asset_delete` 副作用：**未调用**（与 WorkspaceFileAssetEndpoint 不同）
+- 影响：项目成员可软删除同项目内**任意 issue** 的 `ISSUE_ATTACHMENT`，无需知道 issue_id
+
+**下载（GET）**
+
+```python
+@allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST])
+def get(self, request, slug, project_id, pk):
+    asset = FileAsset.objects.get(workspace__slug=slug, project_id=project_id, pk=pk)
+    if not asset.is_uploaded:
+        return Response({"error": "..."}, status=status.HTTP_404_NOT_FOUND)
+    # 生成签名 URL 并 302 重定向
+```
+
+- 查询条件：`workspace__slug=slug, project_id=project_id, pk=pk` — **不含 `entity_type`、`issue_id`**
+- `is_uploaded` 校验：✅ 存在
+- 影响：项目成员可下载同项目内**任意 issue** 的 `ISSUE_ATTACHMENT`
+
+### 6.3 `AssetRestoreEndpoint`
 
 代码：`apps/api/plane/app/views/asset/v2.py`
 
 ```python
-class WorkspaceAssetDownloadEndpoint(BaseAPIView):
+class AssetRestoreEndpoint(BaseAPIView):
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
-    def get(self, request, slug, asset_id):
-        asset = FileAsset.objects.get(
-            id=asset_id,
-            workspace__slug=slug,
-            is_uploaded=True,
-        )
-        # ... 生成签名 URL 并 302 重定向
+    def post(self, request, slug, asset_id):
+        asset = FileAsset.all_objects.get(id=asset_id, workspace__slug=slug)
+        asset.is_deleted = False
+        asset.deleted_at = None
+        asset.save(update_fields=["is_deleted", "deleted_at"])
 ```
 
-**关键发现**：该端点的查询条件**不包含 `entity_type` 过滤**，也不包含 `project_id` 过滤。这意味着：
+**恢复条件分析**：
 
-- ✅ 工作区成员可通过此端点下载**任意 entity_type** 的已上传资产，包括 `ISSUE_ATTACHMENT`
-- ✅ 无需知道 issue_id 或 project_id
-- ✅ 仅需工作区成员身份 + asset_id
+| 维度 | 行为 |
+|------|------|
+| 查询管理器 | `FileAsset.all_objects` — **包含已软删除的记录**（默认 `objects` 管理器会过滤 `is_deleted=True` 的记录） |
+| 查询条件 | `id=asset_id, workspace__slug=slug` — **不含 `entity_type`、`project_id`、`issue_id`** |
+| 权限级别 | WORKSPACE |
+| 角色范围 | ADMIN / MEMBER / GUEST |
+| 恢复后状态 | `is_deleted=False, deleted_at=None`，资产重新可见 |
 
-### 6.2 `ProjectAssetDownloadEndpoint`
+**对 `ISSUE_ATTACHMENT` 的影响**：
+
+- 工作区成员可恢复同工作区内**任意项目**的已删除 `ISSUE_ATTACHMENT`，包括非成员项目
+- 无需是原附件的创建者
+- 无需知道 issue_id 或 project_id
+- 恢复后附件重新出现在对应 issue 的列表中（`is_uploaded=True` 且 `is_deleted=False`）
+- **不触发活动日志**：恢复操作不发送 `issue_activity`，不会在 issue 活动流中留下记录
+
+### 6.4 `DuplicateAssetEndpoint`
+
+代码：`apps/api/plane/app/views/asset/v2.py`
 
 ```python
-class ProjectAssetDownloadEndpoint(BaseAPIView):
-    @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="PROJECT")
-    def get(self, request, slug, project_id, asset_id):
-        asset = FileAsset.objects.get(
-            id=asset_id,
-            workspace__slug=slug,
-            project_id=project_id,
-            is_uploaded=True,
-        )
-        # ... 生成签名 URL 并 302 重定向
+class DuplicateAssetEndpoint(BaseAPIView):
+    throttle_classes = [AssetRateThrottle]
+
+    @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+    def post(self, request, slug, asset_id):
+        project_id = request.data.get("project_id", None)
+        entity_id = request.data.get("entity_id", None)
+        entity_type = request.data.get("entity_type", None)
+        # ...
 ```
 
-**关键发现**：该端点的查询条件**同样不包含 `entity_type` 过滤**，也不包含 `issue_id`。这意味着：
-
-- ✅ 项目成员可通过此端点下载该项目的**任意 entity_type** 资产，包括 `ISSUE_ATTACHMENT`
-- ✅ 无需知道 issue_id
-- ✅ 仅需项目成员身份 + project_id + asset_id
-
-### 6.3 绕过路径汇总
-
-| 正常访问路径 | 绕过路径 | 绕过所需条件 |
-|-------------|----------|-------------|
-| `IssueAttachmentV2Endpoint.get`（需 issue URL） | `ProjectAssetDownloadEndpoint.get`（仅需 project URL） | 项目成员身份 + asset_id |
-| `IssueAttachmentV2Endpoint.get`（需 issue URL） | `WorkspaceAssetDownloadEndpoint.get`（仅需 workspace URL） | 工作区成员身份 + asset_id |
-
-**影响评估**：
-
-- 由于 `asset_url` 属性生成的下载路径始终指向 `IssueAttachmentV2Endpoint`，前端正常流程不会使用 Download 端点。但在代码层面，Download 端点确实提供了不经过 issue URL 访问 `ISSUE_ATTACHMENT` 资产的通道。
-- `WorkspaceAssetDownloadEndpoint` 的权限级别为 WORKSPACE，因此**跨项目**的工作区成员也能通过此端点下载其他项目中的 `ISSUE_ATTACHMENT` 资产（只要知道 asset_id）。
-- 此行为与 `StaticFileAssetEndpoint` 不同——后者在代码中通过 `entity_type` 白名单限制为 LOGO/AVATAR/COVER 类型，而 Download 端点未做此限制。
-
-### 6.4 `WorkspaceFileAssetEndpoint` 的 GET 和 PATCH
+**来源资产校验规则**：
 
 ```python
-class WorkspaceFileAssetEndpoint(BaseAPIView):
-    @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
-    def get(self, request, slug, asset_id):
-        asset = FileAsset.objects.get(id=asset_id, workspace__slug=slug)
-        # ... 返回序列化数据（含 asset_url 等元信息）
-
-    @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
-    def patch(self, request, slug, asset_id):
-        asset = FileAsset.objects.get(id=asset_id, workspace__slug=slug)
-        # ... 更新 is_uploaded 等字段
+user_workspace_ids = WorkspaceMember.objects.filter(
+    member=request.user, is_active=True,
+).values_list("workspace_id", flat=True)
+original_asset = FileAsset.objects.filter(
+    id=asset_id,
+    is_uploaded=True,
+    workspace_id__in=user_workspace_ids,
+).first()
 ```
 
-这两个方法同样不区分 `entity_type`，允许工作区成员对任意类型资产执行读取元信息和确认上传操作。
+| 维度 | 行为 |
+|------|------|
+| 工作区范围 | 限定为用户所属的活跃工作区 |
+| `entity_type` | ❌ 不限制，可复制任意类型包括 `ISSUE_ATTACHMENT` |
+| `project_id` | ❌ 不限制，可跨项目复制 |
+| `is_uploaded` | ✅ 必须已上传 |
+| `is_deleted` | 默认管理器自动过滤软删除记录 |
+
+**目标实体校验规则**：
+
+```python
+if project_id:
+    if not Project.objects.filter(id=project_id, workspace=workspace).exists():
+        return Response({"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND)
+```
+
+| 维度 | 行为 |
+|------|------|
+| 目标工作区 | URL 中的 `slug`，由 `@allow_permission(level="WORKSPACE")` 校验用户成员身份 |
+| 目标项目 | 若指定 `project_id`，校验该项目属于目标工作区 |
+| `entity_type` | 由请求体 `entity_type` 字段指定，**不校验是否与来源资产一致** |
+| `entity_id` | 由请求体 `entity_id` 字段指定，通过 `get_entity_id_field` 映射到 `issue_id`/`comment_id` 等，**不校验目标实体是否存在** |
+
+**对 `ISSUE_ATTACHMENT` 的影响**：
+
+- 工作区成员可将同工作区内任意项目的 `ISSUE_ATTACHMENT` 复制到目标项目/issue
+- 来源资产的 `entity_type` 与目标的 `entity_type` 无需一致（例如可将 `ISSUE_ATTACHMENT` 复制为 `ISSUE_DESCRIPTION`，反之亦然）
+- 复制后的资产 `is_uploaded=True`，可立即下载
+- 存储层执行 `storage.copy_object()` 产生独立的对象存储副本
+
+### 6.5 通用资产端点对附件权限的影响汇总
+
+下表汇总所有通用资产端点的操作对 `ISSUE_ATTACHMENT` 的影响：
+
+| 端点 | 操作 | 查询含 entity_type? | 查询含 project_id? | 查询含 issue_id? | 权限级别 | 对 ISSUE_ATTACHMENT 的影响 |
+|------|------|--------------------|--------------------|------------------|----------|--------------------------|
+| `WorkspaceFileAssetEndpoint` | PATCH 确认上传 | ❌ | ❌ | ❌ | WORKSPACE | 工作区成员可确认任意项目的附件上传 |
+| `WorkspaceFileAssetEndpoint` | DELETE 删除 | ❌ | ❌ | ❌ | WORKSPACE | 工作区成员可删除任意项目的附件 |
+| `WorkspaceFileAssetEndpoint` | GET 下载 | ❌ | ❌ | ❌ | WORKSPACE | 工作区成员可下载任意项目的附件 |
+| `ProjectAssetEndpoint` | PATCH 确认上传 | ❌ | ✅ | ❌ | PROJECT | 项目成员可确认任意 issue 的附件上传 |
+| `ProjectAssetEndpoint` | DELETE 删除 | ❌ | ✅ | ❌ | PROJECT | 项目成员可删除任意 issue 的附件 |
+| `ProjectAssetEndpoint` | GET 下载 | ❌ | ✅ | ❌ | PROJECT | 项目成员可下载任意 issue 的附件 |
+| `WorkspaceAssetDownloadEndpoint` | GET 下载 | ❌ | ❌ | ❌ | WORKSPACE | 工作区成员可下载任意项目的附件 |
+| `ProjectAssetDownloadEndpoint` | GET 下载 | ❌ | ✅ | ❌ | PROJECT | 项目成员可下载任意 issue 的附件 |
+| `AssetRestoreEndpoint` | POST 恢复 | ❌ | ❌ | ❌ | WORKSPACE | 工作区成员可恢复任意项目的已删除附件 |
+| `DuplicateAssetEndpoint` | POST 复制 | ❌ | ❌ | ❌ | WORKSPACE | 工作区成员可复制任意项目的附件 |
+
+**对比 `StaticFileAssetEndpoint`**（唯一做了 `entity_type` 限制的通用端点）：
+
+```python
+class StaticFileAssetEndpoint(BaseAPIView):
+    permission_classes = [AllowAny]
+    def get(self, request, asset_id):
+        asset = FileAsset.objects.get(id=asset_id)
+        if asset.entity_type not in [USER_AVATAR, USER_COVER, WORKSPACE_LOGO, PROJECT_COVER]:
+            return Response({"error": "Invalid entity type."}, status=status.HTTP_400_BAD_REQUEST)
+```
+
+`StaticFileAssetEndpoint` 是通用资产端点中唯一在代码层面校验 `entity_type` 的，将可访问范围限制在公共展示类资产。其余端点均不做此限制，`ISSUE_ATTACHMENT` 可被任意操作。
+
+### 6.6 通用端点与 issue URL 的权限差异
+
+| 操作 | 通过 issue URL（`IssueAttachmentV2Endpoint`） | 通过通用端点（如 `WorkspaceFileAssetEndpoint`） |
+|------|---------------------------------------------|---------------------------------------------|
+| 下载附件 | 需项目成员身份 | 需工作区成员身份（可跨项目） |
+| 确认上传 | 需项目成员身份 | 需工作区成员身份（可跨项目） |
+| 删除附件 | 仅 ADMIN + 资源创建者 | 工作区任意成员（可跨项目） |
+| 恢复已删除附件 | 无直接路径（`AssetRestoreEndpoint` 是唯一途径） | 需工作区成员身份 |
+| 复制附件 | 无直接路径（`DuplicateAssetEndpoint` 是唯一途径） | 需工作区成员身份 |
+
+**核心结论**：通用资产端点将 `ISSUE_ATTACHMENT` 的变更权限从**项目级**降级为**工作区级**。通过这些端点，非项目成员的工作区成员可对项目内的附件执行下载、确认上传、删除、恢复操作，且无需经过 issue URL 路径。
 
 ---
 
@@ -661,6 +826,7 @@ validateFilename(filename)  →  返回 string | null
 | **权限分层** | PROJECT 级（工单附件）和 WORKSPACE 级（工作区资产）两级权限控制 |
 | **权限粒度** | 附件访问与变更隔离粒度为**项目级**，非工单级。同项目内用户可通过 asset_id 访问任意工单的附件 |
 | **跨工单变更** | API 侧 `user_has_issue_permission(issue=issue, allow_creator=True)` 与 `FileAsset` 查询不含 `issue_id` 组合，导致非项目成员的 issue 创建者可变更同项目其他 issue 的附件（5.8 节） |
+| **通用端点权限降级** | `WorkspaceFileAssetEndpoint`、`ProjectAssetEndpoint`、`AssetRestoreEndpoint`、`DuplicateAssetEndpoint` 均不按 `entity_type` 过滤，将 `ISSUE_ATTACHMENT` 变更权限从项目级降级为工作区级（6.5 节） |
 | **Download 端点绕过** | `WorkspaceAssetDownloadEndpoint` 和 `ProjectAssetDownloadEndpoint` 不按 `entity_type` 过滤，工作区/项目成员可绕过 issue URL 下载 `ISSUE_ATTACHMENT` 资产 |
 | **角色控制** | ADMIN/MEMBER/GUEST 三级角色，App V2 删除操作仅 ADMIN 或创建者；API 侧删除允许所有角色 + issue 创建者 |
 | **工作区隔离** | 存储键包含 workspace_id，查询均限定工作区范围 |
