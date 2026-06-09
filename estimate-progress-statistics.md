@@ -480,7 +480,7 @@ class AnalyticsEndpoint(BaseAPIView):
 queryset = queryset.annotate(estimate=Sum(Cast("estimate_point__value", FloatField())))
 ```
 
-这里 **没有** `estimate_point__estimate__type="points"` 过滤，也 **没有** `estimate_point__isnull=False` 过滤。所有 issue 都参与聚合，没有 estimate_point 的 issue 的 `estimate_point__value` 为 null，Cast 后也为 null，Sum 时被忽略。如果项目使用 CATEGORIES 类型，`Cast("XS", FloatField())` 结果为 null，同样被 Sum 忽略。
+这里 **没有** `estimate_point__estimate__type="points"` 过滤，也 **没有** `estimate_point__isnull=False` 过滤。所有 issue 都参与聚合，没有 estimate_point 的 issue 通过 FK LEFT JOIN 后 `estimate_point__value` 为 null，`Cast(null AS double precision)` 返回 null，`Sum` 忽略 null——这部分正常。**但 CATEGORIES 类型会触发 PostgreSQL 错误**：Django 的 `Cast("estimate_point__value", FloatField())` 生成 SQL `CAST(estimate_point_value AS DOUBLE PRECISION)`。PostgreSQL 对非数字字符串（如 "XS"、"S"、"M"）执行 CAST 时会抛出错误码 22P02（`invalid input syntax for type double precision`），**不会静默返回 null**。因此，如果项目使用 CATEGORIES 类型 estimate 且前端绕过守卫发送了 `y_axis=estimate` 请求，后端会返回 500 错误。TIME 类型的 value 是数字字符串（如 "1"、"60"），`CAST` 可以正常转为 float，不会报错。
 
 #### 7.1.2 DefaultAnalyticsEndpoint（默认统计面板）
 
@@ -499,44 +499,44 @@ total_estimate_sum = base_issues.aggregate(sum=Sum("point"))["sum"]
 
 ### 7.2 前端筛选与图表展示流程
 
-1. **Y 轴指标筛选**：`apps/web/core/components/analytics/select/select-y-axis.tsx` 提供 `issue_count` 和 `estimate` 两个选项。当选择 `estimate` 时，前端会检查当前项目的 estimate 是否启用且类型为 POINTS：
+1. **Y 轴指标筛选**：`apps/web/core/components/analytics/select/select-y-axis.tsx` 提供选项列表 `ANALYTICS_Y_AXIS_VALUES`（定义在 `packages/constants/src/analytics/common.ts#L175-L188`），包含三个值：`WORK_ITEM_COUNT`（"Work item"）、`ESTIMATE_POINT_COUNT`（"Estimate"）、`EPIC_WORK_ITEM_COUNT`（"Epic"）。
 
-```ts
-const isEstimateEnabled = (analyticsOption: string) => {
-  if (analyticsOption === "estimate") {
-    if (
-      projectId &&
-      currentActiveEstimateId &&
-      areEstimateEnabledByProjectId(projectId.toString()) &&
-      estimateById(currentActiveEstimateId)?.type === EEstimateSystem.POINTS
-    ) {
-      return true;
-    } else {
-      return false;
-    }
-  }
-  return true;
-};
-```
+   其中 `ESTIMATE_POINT_COUNT` 通过 `hiddenOptions` 默认隐藏（`apps/web/core/components/analytics/select/analytics-params.tsx#L56`）：
 
-只有项目 estimate 类型为 POINTS 时，`estimate` 选项才可见。CATEGORIES 和 TIME 类型下该选项被隐藏。
+   ```ts
+   hiddenOptions={[
+     ChartYAxisMetric.ESTIMATE_POINT_COUNT,
+     isEpic ? ChartYAxisMetric.WORK_ITEM_COUNT : ChartYAxisMetric.EPIC_WORK_ITEM_COUNT,
+   ]}
+   ```
 
-2. **后端请求**：`AnalyticsEndpoint` 通过 `x_axis`、`y_axis`、`segment` 参数控制图表维度。支持的 x_axis 包括 `estimate_point__value`，可以将 estimate 值作为 X 轴分组。
+   `isEstimateEnabled` 守卫逻辑（`apps/web/core/components/analytics/select/select-y-axis.tsx#L29-L44`）检查的是 `analyticsOption === "estimate"`，但实际传入的 option.value 是 `ChartYAxisMetric.ESTIMATE_POINT_COUNT`（即 `"ESTIMATE_POINT_COUNT"`），而非字符串 `"estimate"`。因此 `isEstimateEnabled("ESTIMATE_POINT_COUNT")` 中 `analyticsOption === "estimate"` **永远为 false**，该函数始终返回 `true`——**守卫条件形同虚设**。
+
+   实际隐藏 `ESTIMATE_POINT_COUNT` 选项的是 `hiddenOptions` 参数，而非 `isEstimateEnabled` 守卫。这意味着在当前代码中，**Estimate 选项始终被隐藏**，不管项目是否启用了 POINTS 类型 estimate。用户在正常 UI 流程中无法选择 Estimate 作为 Y 轴。
+
+2. **后端请求**：`AnalyticsEndpoint` 通过 `x_axis`、`y_axis`、`segment` 参数控制图表维度。`VALID_YAXIS = ["issue_count", "estimate"]`（`apps/api/plane/utils/analytics_plot.py#L40`），后端接受 `"estimate"` 作为 y_axis 值。但前端传给后端的 y_axis 值来自 `ChartYAxisMetric` 枚举（如 `"WORK_ITEM_COUNT"`），与后端 `VALID_YAXIS` 的 `"issue_count"` / `"estimate"` 值域不同——需注意前端和后端之间存在值映射层。
 
 3. **数据渲染**：后端返回的 `distribution` 是按 x_axis 分组的聚合结果，前端用柱状图或折线图展示。
 
-### 7.3 项目维度 analytics 的过滤条件特点
+### 7.3 项目维度 analytics 中 y_axis=estimate 的实际可达路径
 
-与 Cycle/Module 的 estimate 汇总不同，项目维度 `AnalyticsEndpoint` 的 `build_graph_plot` 在 `y_axis="estimate"` 时：
+`build_graph_plot` 在 `y_axis="estimate"` 时的行为取决于项目 estimate 类型：
 
-| 特征 | AnalyticsEndpoint (build_graph_plot) | CycleProgressEndpoint |
-|------|--------------------------------------|----------------------|
-| estimate type 过滤 | **无** | `estimate_point__estimate__type="points"` |
-| estimate_point 非空过滤 | **无**（null 被 Sum 忽略） | 隐含（FK join 自然排除 null） |
-| 包含 CATEGORIES 型 | 是（但 value 无法 Cast 为 float，Sum 结果为 null） | 否 |
-| 包含 TIME 型 | 是（value 可 Cast 为 float，Sum 结果包含） | 否 |
+| 项目 estimate 类型 | `build_graph_plot(y_axis="estimate")` 结果 | 原因 |
+|---|---|---|
+| POINTS | 正常返回 estimate 汇总值 | value 为数字字符串，CAST 成功 |
+| TIME | 正常返回 estimate 汇总值 | value 为数字字符串，CAST 成功；但前端已隐藏该选项 |
+| CATEGORIES | **PostgreSQL 报错（22P02）** | value 如 "XS" 无法 CAST 为 DOUBLE PRECISION |
+| 无 estimate | 每个 x_axis 分组的 estimate 值为 null | estimate_point 为 null，Cast(null) = null，Sum 忽略 |
 
-这意味着：如果一个项目使用 TIME 类型 estimate，在项目维度 Analytics 中选择 `y_axis=estimate` 可以看到汇总值，但在 Cycle/Module 维度中 estimate points 始终为 0。这是又一层统计口径不一致。
+**但正常 UI 流程中，y_axis=estimate 不可达**：前端 `ESTIMATE_POINT_COUNT` 通过 `hiddenOptions` 始终隐藏，用户无法选择 Estimate 作为 Y 轴。`isEstimateEnabled` 守卫因字符串不匹配而失效，但 `hiddenOptions` 作为事实上的防护确保了正常使用不会触发问题。
+
+**如果直接调用 API 发送 `y_axis=estimate`**：
+- POINTS 项目：正常工作
+- TIME 项目：正常工作，但数据含义不同（value 为分钟数而非点数）
+- CATEGORIES 项目：500 错误（PostgreSQL CAST 失败）
+
+与 Cycle/Module 维度的差异：Cycle/Module 的 estimate 汇总硬编码了 `estimate_point__estimate__type="points"` 过滤，非 POINTS 项目的 estimate_points 为 0 但不会报错。`build_graph_plot` 无此过滤，在 CATEGORIES 项目上直接报错。
 
 ---
 
@@ -684,10 +684,10 @@ Issue 更新
 
 ### 10.4 项目维度 Analytics 与 Cycle/Module 维度口径不一致
 
-`build_graph_plot`（项目维度）在 `y_axis="estimate"` 时 **不做** `estimate_point__estimate__type="points"` 过滤，而 Cycle/Module 维度都做。这意味着：
-- TIME 类型项目在 Analytics 中可以看到 estimate 汇总值
-- 但在 Cycle/Module 中 estimate points 始终为 0
-- 项目维度的 `DefaultAnalyticsEndpoint` 甚至使用的是 **旧版 `point` 字段**，与整个 estimate_point 体系无关
+`build_graph_plot`（项目维度）在 `y_axis="estimate"` 时 **不做** `estimate_point__estimate__type="points"` 过滤，而 Cycle/Module 维度都做。但正常 UI 流程中 Estimate Y 轴选项已被 `hiddenOptions` 隐藏，所以此路径不可达。如果直接调用 API：
+- CATEGORIES 项目在 `build_graph_plot` 中会触发 PostgreSQL CAST 错误（500），而 Cycle/Module 只是 estimate_points 为 0
+- TIME 项目在 `build_graph_plot` 中可正常返回汇总值，但在 Cycle/Module 中 estimate_points 为 0
+- 项目维度的 `DefaultAnalyticsEndpoint` 甚至使用的是 **旧版 `point` 字段**（IntegerField），与整个 estimate_point 体系无关
 
 ### 10.5 子任务 estimate 双重计算
 
@@ -703,4 +703,12 @@ Issue 更新
 
 ### 10.8 TIME hours 模板值与分钟格式化的语义偏差
 
-hours 模板的 value 为 "1"-"6"，被 `convertMinutesToHoursMinutesString` 当作 1-6 分钟处理，显示为 "1m"-"6m"，而非 "1h"-"6h"。这与模板名称 "Hours" 的语义不符。如果用户存入 "60" 来表示 1 小时，展示为 "1h" 是正确的，但默认模板并不提供这样的值。
+hours 模板的 value 为 "1"-"6"，被 `convertMinutesToHoursMinutesString` 当作 1-6 分钟处理，显示为 "1m"-"6m"，而非 "1h"-"6h"。从代码事实看，格式化函数参数名为 `totalMinutes`，按分钟处理是函数的确定行为。从产品意图看，模板名 "Hours" 暗示应表示小时。两者之间的偏差既可能是模板值应为 "60"-"360"（分钟），也可能是格式化函数不应走分钟转换——仅从代码无法确定根因。详见第一节 1.4 的分层分析。
+
+### 10.9 SelectYAxis 守卫条件形同虚设
+
+`isEstimateEnabled` 函数检查 `analyticsOption === "estimate"`，但实际传入的值是 `ChartYAxisMetric.ESTIMATE_POINT_COUNT`（即 `"ESTIMATE_POINT_COUNT"`），与 `"estimate"` 永远不匹配，守卫始终返回 `true`。实际隐藏 Estimate 选项的是 `hiddenOptions` 参数（`apps/web/core/components/analytics/select/analytics-params.tsx#L56`），而非 `isEstimateEnabled` 逻辑。这意味着 `isEstimateEnabled` 中的 POINTS 类型检查从未生效，Estimate 选项对所有项目类型都隐藏。
+
+### 10.10 CATEGORIES 项目直接调 API 会触发 PostgreSQL CAST 错误
+
+`build_graph_plot` 中 `Cast("estimate_point__value", FloatField())` 对 CATEGORIES 类型的非数字 value（如 "XS"）会触发 PostgreSQL 错误码 22P02，而非静默返回 null。虽然前端 `hiddenOptions` 隐藏了 Estimate Y 轴选项使正常 UI 流程不可达，但后端接口本身没有防护，直接调用 API 可导致 500 错误。
