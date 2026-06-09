@@ -4,10 +4,10 @@
 
 Plane 的导入/迁移体系在代码层面涉及两套 API，但两者的实际可达性存在差异：
 
-| 层级 | 用途 | 实际可达性 |
-|------|------|------------|
-| **API v1 (Public API)** | 通用外部系统集成、批量写入 | 路由已挂载，但 **PUT Upsert 端点未暴露** |
-| **App API (内置导入器)** | GitHub / Jira 原生集成向导 | **后端 View/Service 未实现**，仅有 Model/Serializer 壳 |
+| 层级 | 用途 | 后端可达性 | 前端可达性 |
+|------|------|------------|------------|
+| **API v1 (Public API)** | 通用外部系统集成、批量写入 | 路由已挂载，但 **PUT Upsert 端点未暴露** | N/A（API 层） |
+| **App API (内置导入器)** | GitHub / Jira 原生集成向导 | **后端 View/Service 未实现** | **Service 已定义但零调用，无 UI 页面** |
 
 ### 关键文件索引
 
@@ -34,6 +34,12 @@ Plane 的导入/迁移体系在代码层面涉及两套 API，但两者的实际
 | 导入器通用类型 | `packages/types/src/importer/index.ts` |
 | 导出前端服务 | `apps/web/core/services/project/project-export.service.ts` |
 | 导出历史前端 | `apps/web/core/components/exporter/prev-exports.tsx` |
+| 工作区设置常量（侧边栏菜单定义） | `packages/constants/src/settings/workspace.ts` |
+| 工作区设置侧边栏组件 | `apps/web/core/components/settings/workspace/sidebar/item-categories.tsx` |
+| Integrations 页面 | `apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/integrations/page.tsx` |
+| SingleIntegrationCard 组件 | `apps/web/core/components/integration/single-integration-card.tsx` |
+| 项目级 IntegrationCard 组件 | `apps/web/core/components/project/integration-card.tsx` |
+| 定价/计划对比（含 Importers 描述） | `apps/web/core/constants/plans.tsx` |
 | Issue 模型 (external_id) | `apps/api/plane/db/models/issue.py` |
 | Label 模型 (external_id) | `apps/api/plane/db/models/label.py` |
 | State 模型 (external_id) | `apps/api/plane/db/models/state.py` |
@@ -367,7 +373,7 @@ IssueAssignee.objects.bulk_create([...], batch_size=10)
 
 ### 5.1 成员映射
 
-Jira 和 GitHub 导入流程均采用"预览 + 用户决策"模式，该逻辑体现在前端类型定义中：
+Jira 和 GitHub 导入的成员映射策略定义在前端 TypeScript 类型中，但**无 UI 组件实现**，仅作为接口契约存在：
 
 **Jira 端类型（`jira-importer.ts`）：**
 
@@ -398,7 +404,7 @@ interface IGithubServiceImportFormData {
 - `"map"` — 将源系统用户映射到当前工作区已有成员
 - `false` — 不映射，该用户创建的内容归属到导入操作发起人
 
-**注意：** 这些映射逻辑的实现依赖于后端导入器视图，当前未在本仓库中实现。
+**注意：** 这些映射策略仅存在于类型定义中。前端无导入向导 UI，后端无导入器 View，因此 `invite`/`map`/`false` 的实际执行逻辑在开源仓库中完全缺失。
 
 ### 5.2 标签映射
 
@@ -447,37 +453,38 @@ Module 和 Cycle 模型均有 `external_source` / `external_id`。Jira 导入时
 
 ## 六、导入流程详解
 
-### 6.1 内置导入器流程（GitHub / Jira）— 前端就绪、后端缺失
+### 6.1 内置导入器流程（GitHub / Jira）— 前端 Service/Type 存在但 UI 页面缺失
 
 ```
 ┌─────────────┐    ┌──────────────────┐    ┌─────────────────────┐    ┌───────────────┐
 │ 1. 连接源系统 │ →  │ 2. 预览源数据     │ →  │ 3. 用户配置映射策略   │ →  │ 4. 执行导入    │
 │ (输入凭据)    │    │ (获取项目/仓库信息) │    │ (成员/标签/状态映射)  │    │ (后台异步)     │
 └─────────────┘    └──────────────────┘    └─────────────────────┘    └───────────────┘
-      ✅ 前端已实现        ✅ 前端已实现          ✅ 前端已实现            ❌ 后端未实现
+   ⚠️ Service定义     ⚠️ Service定义         ❌ 无UI组件                ❌ 后端未实现
+   无UI组件           无UI组件               无调用入口
+   无调用入口         无调用入口
 ```
 
-**Step 1 — 连接源系统（前端已实现）：**
+**已有代码层：**
 
-- Jira：调用 `GET /api/workspaces/{slug}/importers/jira` 传入 `cloud_hostname`, `api_token`, `email`, `project_key`
-- GitHub：调用 `GET /api/workspaces/{slug}/importers/github/` 传入 `owner`, `repo`
+| 层级 | 存在 | 缺失 |
+|------|------|------|
+| TypeScript 类型 | `IJiraMetadata`, `IJiraResponse`, `IJiraImporterForm`, `IGithubRepoInfo`, `IGithubServiceImportFormData`, `IImporterService` | — |
+| Service 方法 | `JiraImporterService.getJiraProjectInfo`, `createJiraImporter`; `GithubIntegrationService.getGithubRepoInfo`, `createGithubServiceImport` | — |
+| SWR 缓存键 | `JIRA_IMPORTER_DETAIL`, `GITHUB_REPOSITORY_INFO`, `IMPORTER_SERVICES_LIST` | — |
+| UI 页面/组件 | — | 无 Jira/GitHub 导入向导页面，无导入配置表单，无进度展示组件 |
+| 调用链 | Service 类已定义 | **无任何页面或组件调用这些 Service 方法** |
+| 后端 API | — | 无 View、URL、Celery 任务 |
 
-**Step 2 — 预览源数据（前端已实现）：**
+**各步骤分析：**
 
-返回源系统的 issues 计数、labels 计数、collaborators/users 列表等。前端类型 `IJiraResponse` / `IGithubRepoInfo`。
+**Step 1 — 连接源系统：** `JiraImporterService.getJiraProjectInfo` 和 `GithubIntegrationService.getGithubRepoInfo` 已定义，但无 UI 组件调用它们。用户无法在界面上输入 Jira 凭据或 GitHub 仓库名。
 
-**Step 3 — 用户配置映射（前端已实现）：**
+**Step 2 — 预览源数据：** `IJiraResponse` / `IGithubRepoInfo` 类型定义了返回结构（issues 计数、labels、users 列表等），但无 UI 组件展示预览数据。
 
-前端展示预览数据，让用户为每个外部用户选择 `invite` / `map` / `false` 策略。
+**Step 3 — 用户配置映射：** `jira-importer.ts` 和 `github-importer.ts` 类型中定义了 `User.import: "invite" | "map" | false`，但无 UI 组件让用户做映射决策。
 
-**Step 4 — 执行导入（后端缺失）：**
-
-- Jira：`POST /api/workspaces/{slug}/projects/importers/jira/`
-- GitHub：`POST /api/workspaces/{slug}/projects/importers/github/`
-
-请求体包含 `metadata`（连接凭据）、`config`（导入配置）、`data`（用户映射决策）、`project_id`（目标项目）。
-
-这些端点在当前仓库中无对应的 View 实现，推测由 Plane 云端服务处理。
+**Step 4 — 执行导入：** `createJiraImporter` 和 `createGithubServiceImport` 方法已定义，但后端无对应 View。即使前端调用也会收到 404。
 
 ### 6.2 API v1 批量迁移流程 — 可行方案（需注意 PUT 不可达）
 
@@ -570,67 +577,81 @@ GET /api/v1/workspaces/{slug}/projects/{id}/work-items/?external_id=JIRA-456&ext
 
 ---
 
-## 七、前端可见性策略
+## 七、前端可见性审计
 
-### 7.1 导入器列表
+### 7.1 工作区设置侧边栏 — 无 Importer 入口
 
-前端通过 `IntegrationService.getImporterServicesList()` 获取当前工作区的导入服务列表：
+工作区设置侧边栏由 `WORKSPACE_SETTINGS` 常量（`packages/constants/src/settings/workspace.ts`）驱动，包含以下菜单项：
 
-```typescript
-// integration.service.ts
-async getImporterServicesList(workspaceSlug: string): Promise<IImporterService[]> {
-  return this.get(`/api/workspaces/${workspaceSlug}/importers/`)
-}
-```
+| key | href | 分类 |
+|-----|------|------|
+| `general` | `/settings` | Administration |
+| `members` | `/settings/members` | Administration |
+| `billing-and-plans` | `/settings/billing` | Administration |
+| `export` | `/settings/exports` | Administration |
+| `webhooks` | `/settings/webhooks` | Developer |
 
-使用 SWR 缓存 key `IMPORTER_SERVICES_LIST`，在集成设置页展示。由于后端未实现，此调用在自部署环境下会返回 404。
+**关键发现：侧边栏中无 `import` / `importer` / `integrations` 菜单项。** 用户在标准导航中无法找到导入入口。
 
-### 7.2 导出历史轮询（已实现）
+### 7.2 Integrations 页面 — 文件存在但不可导航
 
-`prev-exports.tsx` 实现了自动轮询机制：
+尽管文件系统中存在 `apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/integrations/page.tsx`，该页面可被直接 URL 访问（`/{workspaceSlug}/settings/integrations/`），但：
 
-```typescript
-useEffect(() => {
-  const interval = setInterval(() => {
-    if (exporterServices?.results?.some((service) => service.status === "processing")) {
-      handleRefresh();
-    } else {
-      clearInterval(interval);
-    }
-  }, 3000);
-  return () => clearInterval(interval);
-}, [exporterServices]);
-```
+- **侧边栏无入口**：`WORKSPACE_SETTINGS` 不包含 integrations 项
+- **Power K 无入口**：工作区设置快捷命令仅列举 `WORKSPACE_SETTINGS` 中定义的页面
+- **该页面展示的内容**：调用 `IntegrationService.getAppIntegrationsList()` 获取 GitHub/Slack 等 OAuth 集成列表，使用 `SingleIntegrationCard` 展示安装/卸载按钮。**这是 OAuth 集成（同步），不是导入器（importer）。**
 
-**策略：** 每 3 秒轮询一次，只要列表中存在 `status === "processing"` 的记录就继续刷新，全部完成后停止轮询。
+`SingleIntegrationCard` 组件仅处理 OAuth 安装/卸载（`useIntegrationPopup` → 重定向到 GitHub/Slack OAuth 授权），不涉及数据导入功能。
 
-### 7.3 权限控制
+### 7.3 导入器 Service 方法 — 已定义但从未被调用
 
-- **集成/导入页面**：仅工作区 Admin 可见（`EUserPermissions.ADMIN` + `EUserPermissionsLevel.WORKSPACE`）
-- **导出页面**：Admin + Member 可见（`EUserPermissions.ADMIN, EUserPermissions.MEMBER`）
-- **API v1 端点**：通过 `ProjectEntityPermission` / `ProjectMemberPermission` 控制读写权限，需 API Key 认证（`APIKeyAuthentication`）
+| Service 方法 | 定义位置 | 调用情况 |
+|-------------|----------|----------|
+| `JiraImporterService.getJiraProjectInfo` | `jira.service.ts` | ❌ 全仓库零调用 |
+| `JiraImporterService.createJiraImporter` | `jira.service.ts` | ❌ 全仓库零调用 |
+| `GithubIntegrationService.getGithubRepoInfo` | `github.service.ts` | ❌ 全仓库零调用 |
+| `GithubIntegrationService.createGithubServiceImport` | `github.service.ts` | ❌ 全仓库零调用 |
+| `IntegrationService.getImporterServicesList` | `integration.service.ts` | ❌ 全仓库零调用 |
+| `IntegrationService.deleteImporterService` | `integration.service.ts` | ❌ 全仓库零调用 |
 
-### 7.4 导入状态流转
+SWR 缓存键 `IMPORTER_SERVICES_LIST`、`JIRA_IMPORTER_DETAIL`、`GITHUB_REPOSITORY_INFO` 同样已定义但从未被任何 `useSWR` 调用引用。
 
-前端 `IImporterService` 类型中 `status` 为联合类型：
+### 7.4 导入进度展示 — 无实现
 
-```typescript
-status: "processing" | "completed" | "failed"
-```
+开源前端中不存在任何导入进度展示组件。对比导出功能的完整实现：
 
-后端 `Importer` 模型额外有 `"queued"` 状态。前端展示策略：
-- `processing` → 显示进度指示
-- `completed` → 显示成功标记
-- `failed` → 显示错误信息
+| 功能 | 导出 (Export) | 导入 (Import) |
+|------|--------------|--------------|
+| 触发表单 | `ExportForm` 组件 | ❌ 无 |
+| 历史列表 | `PrevExports` 组件 + Table | ❌ 无 |
+| 进度轮询 | 3 秒轮询 `processing` 状态 | ❌ 无 |
+| 侧边栏入口 | ✅ `export` 在 `WORKSPACE_SETTINGS` | ❌ 无 |
+| 后端 API | `ExportIssuesEndpoint` (GET/POST) | ❌ 无 View |
 
-### 7.5 SWR 缓存键
+### 7.5 定价页面中的 Importers 描述
 
-| 键 | 用途 |
-|------|------|
-| `IMPORTER_SERVICES_LIST` | 导入器列表 |
-| `JIRA_IMPORTER_DETAIL` | Jira 项目预览信息 |
-| `GITHUB_REPOSITORY_INFO` | GitHub 仓库信息 |
-| `EXPORT_SERVICES_LIST` | 导出历史列表 |
+`plans.tsx` 中有一个 `id: "importers"` 的定价对比组，描述 Jira 和 GitHub 导入在所有付费计划（含 free）中可用（"Without custom props" 或 "With custom props"）。这说明导入功能在 Plane 产品规划中属于标准功能，但开源仓库中尚未落地。
+
+### 7.6 权限控制
+
+- **Integrations 页面**（如手动访问 URL）：仅工作区 Admin 可见（`EUserPermissions.ADMIN` + `EUserPermissionsLevel.WORKSPACE`）
+- **Exports 页面**：Admin + Member 可见
+- **API v1 端点**：需 API Key 认证（`APIKeyAuthentication`），通过 `ProjectEntityPermission` 控制读写
+
+### 7.7 前端可见性总结
+
+| 维度 | 状态 | 说明 |
+|------|------|------|
+| 导航入口 | ❌ | 侧边栏无 Importer/Import 菜单项 |
+| URL 直接访问 | ❌ | 无 importer 相关页面路由 |
+| 导入向导组件 | ❌ | 无 Jira/GitHub 导入配置/预览/映射 UI |
+| 导入进度展示 | ❌ | 无进度条、状态轮询、历史记录组件 |
+| Service 层 | ⚠️ | 类和方法已定义，但零调用 |
+| TypeScript 类型 | ✅ | 完整定义了导入相关接口 |
+| SWR 缓存键 | ⚠️ | 已定义，但零引用 |
+| 后端 API | ❌ | 无 View/URL/Task |
+
+**结论：开源前端不具备可操作的 importers 入口和导入进度展示功能。** 前端代码中仅保留了 Service 层和类型定义作为"接口骨架"，推测是为 Plane 云端版本的导入器 UI 预留的契约，自部署环境无法使用。
 
 ---
 
