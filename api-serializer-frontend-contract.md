@@ -217,7 +217,7 @@ api 层的 mapper 定义在 [api/serializers/base.py#L91-L106](file:///d:/fz/050
 | updated_by | ❌ | ❌ | ✅ UserLiteSerializer |
 | estimate_point | ❌ | ❌ | ✅ EstimatePointSerializer |
 | issue_attachment | ❌ | ✅ (单数, 但不可用) | ❌ |
-| issue_attachments 特殊查询 | ✅ (复数, FileAsset) | ✅ (复数, FileAsset) | ❌ |
+| issue_attachments 特殊查询 | ❌ (不属于此阶段) | ✅ (复数, FileAsset) | ❌ |
 | assignees | ✅ UserLiteSerializer | ✅ UserLiteSerializer | ❌ |
 | labels | ✅ LabelSerializer | ✅ LabelSerializer | ❌ |
 | issue_cycle | ✅ CycleIssueSerializer | ✅ CycleIssueSerializer | ❌ |
