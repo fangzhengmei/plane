@@ -132,7 +132,11 @@ required_fields = [
 
 ### 4.1 Expansion Mapper
 
-app 层的 expansion mapper 定义在 [app/serializers/base.py#L74-L96](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/serializers/base.py#L74-L96)：
+app 层 `DynamicBaseSerializer` 中有**两个独立的** expansion mapper，分别服务于不同阶段：
+
+#### `_filter_fields` 阶段的 mapper（[base.py#L74-L96](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/serializers/base.py#L74-L96)）
+
+用于在 `__init__` 时动态向 `self.fields` 添加缺失字段：
 
 | 字段名 | 展开序列化器 | many |
 |--------|-------------|------|
@@ -140,36 +144,100 @@ app 层的 expansion mapper 定义在 [app/serializers/base.py#L74-L96](file:///
 | workspace | WorkspaceLiteSerializer | False |
 | project | ProjectLiteSerializer | False |
 | state | StateLiteSerializer | False |
+| default_assignee | UserLiteSerializer | False |
+| project_lead | UserLiteSerializer | False |
+| created_by | UserLiteSerializer | False |
+| issue | IssueSerializer | False |
+| actor | UserLiteSerializer | False |
+| owned_by | UserLiteSerializer | False |
+| members | UserLiteSerializer | True |
 | assignees | UserLiteSerializer | True |
 | labels | LabelSerializer | True |
-| parent | IssueLiteSerializer | False |
-| sub_issues | IssueLiteSerializer | True |
 | issue_cycle | CycleIssueSerializer | True |
+| parent | IssueLiteSerializer | False |
 | issue_relation | IssueRelationSerializer | True |
+| issue_intake | IntakeIssueLiteSerializer | True |
+| issue_related | RelatedIssueSerializer | True |
 | issue_reactions | IssueReactionLiteSerializer | True |
 | issue_link | IssueLinkLiteSerializer | True |
-| issue_attachment | IssueAttachmentLiteSerializer | True |
-| default_assignee / project_lead / created_by / actor / owned_by | UserLiteSerializer | False |
+| sub_issues | IssueLiteSerializer | True |
 
-api 层的 mapper ([api/serializers/base.py#L91-L106](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/api/serializers/base.py#L91-L106)) 略有不同：
+**注意**：此 mapper **不包含** `issue_attachment` 和 `updated_by`。虽然 `many=True` 列表（第103-115行）中有 `"issue_attachment"`，但 mapper 字典中没有该 key，因此无法通过 `_filter_fields` 动态添加该字段——这是死代码。
 
-| 差异字段 | app | api |
-|---------|-----|-----|
-| updated_by | ❌ | UserLiteSerializer |
-| estimate_point | ❌ | EstimatePointSerializer |
-| labels | LabelSerializer | ❌ (在 IssueExpandSerializer 单独处理) |
-| issue_cycle / issue_relation / issue_reactions / issue_link / sub_issues | 各自 Lite Serializer | ❌ |
+#### `to_representation` 阶段的 mapper（[base.py#L148-L171](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/serializers/base.py#L148-L171)）
+
+用于在序列化输出时替换 FK id 值为嵌套对象。与 `_filter_fields` mapper 的差异：
+
+| 字段名 | `_filter_fields` mapper | `to_representation` mapper |
+|--------|------------------------|---------------------------|
+| issue_attachment | ❌ 不在 | ✅ IssueAttachmentLiteSerializer |
+| 其他 21 个字段 | ✅ 同 | ✅ 同（但此处 `issue_attachment` 为单数 key） |
+
+此外，`to_representation` 还有 `issue_attachments`（复数）的**特殊 FileAsset 查询**（[base.py#L183-L199](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/serializers/base.py#L183-L199)），完全绕过 mapper，直接查询 `FileAsset` 模型。
+
+#### 两阶段 mapper 差异的后果
+
+当前端传 `expand=issue_attachments`（复数）时：
+1. `_filter_fields`：mapper 没有 `issue_attachments` 也不会添加 → 字段不在 `self.fields` 中
+2. `to_representation`：mapper key 是 `issue_attachment`（单数）≠ `issue_attachments`（复数），不匹配 → mapper 不处理
+3. 特殊 FileAsset 查询：`if "issue_attachments" in self.expand:` → **命中**，直接查询并写入 `response["issue_attachments"]`
+
+当传 `expand=issue_attachment`（单数）时：
+1. `_filter_fields`：mapper 没有 `issue_attachment` → 不会添加字段
+2. `to_representation`：mapper key 匹配 → 但 `issue_attachment` 不在 `self.fields` 中（因为 `_filter_fields` 没添加），且第128行 `if expand in self.fields:` 不满足 → **不会展开**
+3. 特殊 FileAsset 查询：`"issue_attachments" in self.expand` 为 False → **不命中**
+
+**结论**：单数 `issue_attachment` 实际上**完全无法工作**——`_filter_fields` 无法添加它，`to_representation` 的 mapper 虽有对应 key 但 `self.fields` 检查不通过。只有复数 `issue_attachments` 通过特殊 FileAsset 查询才能生效。
+
+#### api 层 mapper
+
+api 层的 mapper 定义在 [api/serializers/base.py#L91-L106](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/api/serializers/base.py#L91-L106)，仅有 `to_representation` 阶段一个 mapper（api 层的 `_filter_fields` 不含 mapper，仅做白名单裁剪）：
+
+| 字段名 | 展开序列化器 |
+|--------|-------------|
+| user | UserLiteSerializer |
+| workspace | WorkspaceLiteSerializer |
+| project | ProjectLiteSerializer |
+| default_assignee | UserLiteSerializer |
+| project_lead | UserLiteSerializer |
+| state | StateLiteSerializer |
+| created_by | UserLiteSerializer |
+| **updated_by** | UserLiteSerializer |
+| issue | IssueSerializer |
+| actor | UserLiteSerializer |
+| owned_by | UserLiteSerializer |
+| members | UserLiteSerializer |
+| parent | IssueLiteSerializer |
+| **estimate_point** | EstimatePointSerializer |
+
+与 app 层 mapper 的关键差异：
+
+| 差异字段 | app `_filter_fields` | app `to_representation` | api `to_representation` |
+|---------|---------------------|------------------------|------------------------|
+| updated_by | ❌ | ❌ | ✅ UserLiteSerializer |
+| estimate_point | ❌ | ❌ | ✅ EstimatePointSerializer |
+| issue_attachment | ❌ | ✅ (单数, 但不可用) | ❌ |
+| issue_attachments 特殊查询 | ✅ (复数, FileAsset) | ✅ (复数, FileAsset) | ❌ |
+| assignees | ✅ UserLiteSerializer | ✅ UserLiteSerializer | ❌ |
+| labels | ✅ LabelSerializer | ✅ LabelSerializer | ❌ |
+| issue_cycle | ✅ CycleIssueSerializer | ✅ CycleIssueSerializer | ❌ |
+| issue_relation | ✅ IssueRelationSerializer | ✅ IssueRelationSerializer | ❌ |
+| issue_reactions | ✅ IssueReactionLiteSerializer | ✅ IssueReactionLiteSerializer | ❌ |
+| issue_link | ✅ IssueLinkLiteSerializer | ✅ IssueLinkLiteSerializer | ❌ |
+| sub_issues | ✅ IssueLiteSerializer | ✅ IssueLiteSerializer | ❌ |
+| issue_intake | ✅ IntakeIssueLiteSerializer | ✅ IntakeIssueLiteSerializer | ❌ |
+| issue_related | ✅ RelatedIssueSerializer | ✅ RelatedIssueSerializer | ❌ |
 
 ### 4.2 展开的两阶段处理
 
 **阶段一：`__init__` 中的 `_filter_fields`**
-- 动态添加 expand 对应的 serializer 字段到 `self.fields`
-- 此时决定字段是否出现在输出中
+- 遍历 expand 列表，对不在 `self.fields` 中但在 `_filter_fields` mapper 中的字段，动态添加对应 serializer
+- 此时决定字段是否出现在 `self.fields` 中
+- **限制**：`issue_attachment` 不在此 mapper 中，无法被添加；`updated_by` 同理
 
 **阶段二：`to_representation` 中的实际展开**
-- 遍历 `self.expand`
-- 对每个 expand 字段，用对应的 Lite Serializer 替换原始 FK id 值
-- 特殊处理 `issue_attachments`：手动查询 `FileAsset` 模型
+- 遍历 `self.expand`，对同时在 `self.fields` 和 `to_representation` mapper 中的字段，用对应 Lite Serializer 替换原始值
+- **特殊处理** `issue_attachments`（复数）：不在 `self.fields` 检查范围内，通过独立条件 `if "issue_attachments" in self.expand:` 直接查询 `FileAsset` 模型
 
 ### 4.3 api 层 IssueSerializer 的特殊展开
 
@@ -737,21 +805,33 @@ export type TIssueParams =
 
 ### 13.2 后端 expansion mapper 支持的 expand 值
 
-app 层 mapper（[app/serializers/base.py#L74-L96](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/serializers/base.py#L74-L96)）支持的完整列表：
+app 层有**两个** mapper，支持的字段不同：
 
-`user`, `workspace`, `project`, `state`, `assignees`, `labels`, `parent`, `sub_issues`, `issue_cycle`, `issue_relation`, `issue_reactions`, `issue_link`, `issue_attachment`, `default_assignee`, `project_lead`, `created_by`, `actor`, `owned_by`, `updated_by`, `issue_related`
+**`_filter_fields` mapper**（[base.py#L74-L96](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/serializers/base.py#L74-L96)）支持 21 个值：
+
+`user`, `workspace`, `project`, `state`, `default_assignee`, `project_lead`, `created_by`, `issue`, `actor`, `owned_by`, `members`, `assignees`, `labels`, `issue_cycle`, `parent`, `issue_relation`, `issue_intake`, `issue_related`, `issue_reactions`, `issue_link`, `sub_issues`
+
+**`to_representation` mapper**（[base.py#L148-L171](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/serializers/base.py#L148-L171)）支持 22 个值（比 `_filter_fields` 多 `issue_attachment`）：
+
+上述 21 个 + `issue_attachment`
+
+**特殊 FileAsset 查询**（[base.py#L183-L199](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/serializers/base.py#L183-L199)）支持 1 个值：
+
+`issue_attachments`（复数，不在任何 mapper 中）
+
+**两个 mapper 都不支持**：`updated_by`（仅在 api 层 mapper 中）、`issue_inbox`（仅在 InboxIssueSerializer 中）
 
 ### 13.3 逐项核对
 
-| 前端 expand 值 | 后端 mapper 是否支持 | 后端 view 是否 prefetch | 一致性 |
-|---------------|-------------------|----------------------|-------|
-| `issue_reactions` | ✅ IssueReactionLiteSerializer | ✅ retrieve 有 prefetch_related | ✅ 一致 |
-| `issue_attachments` | ✅ IssueAttachmentLiteSerializer | ✅ to_representation 手动查 FileAsset | ✅ 一致 |
-| `issue_link` | ✅ IssueLinkLiteSerializer | ✅ retrieve 有 prefetch_related | ✅ 一致 |
-| `parent` | ✅ IssueLiteSerializer | ✅ retrieve 有 select_related | ✅ 一致 |
-| `issue_relation` | ✅ IssueRelationSerializer | ✅ IssueDetailEndpoint 有 prefetch_related | ✅ 一致 |
-| `issue_related` | ✅ RelatedIssueSerializer | ✅ IssueDetailEndpoint 有 prefetch_related | ✅ 一致 |
-| `issue_inbox` | ❌ **不在 mapper 中** | N/A (Inbox 有独立序列化) | ⚠️ 见下文 |
+| 前端 expand 值 | `_filter_fields` mapper | `to_representation` mapper | 特殊 FileAsset 查询 | 实际生效路径 | 一致性 |
+|---------------|----------------------|-------------------------|-------------------|------------|-------|
+| `issue_reactions` | ✅ IssueReactionLiteSerializer | ✅ IssueReactionLiteSerializer | — | mapper 两阶段联动 | ✅ |
+| `issue_attachments` | ❌ 不在 mapper 中 | ❌ mapper key 是 `issue_attachment`(单数)，不匹配 | ✅ 直接查 FileAsset | 仅特殊 FileAsset 查询 | ⚠️ 绕过 mapper |
+| `issue_link` | ✅ IssueLinkLiteSerializer | ✅ IssueLinkLiteSerializer | — | mapper 两阶段联动 | ✅ |
+| `parent` | ✅ IssueLiteSerializer | ✅ IssueLiteSerializer | — | mapper 两阶段联动 | ✅ |
+| `issue_relation` | ✅ IssueRelationSerializer | ✅ IssueRelationSerializer | — | mapper 两阶段联动 (列表走 IssueListDetailSerializer) | ✅ |
+| `issue_related` | ✅ RelatedIssueSerializer | ✅ RelatedIssueSerializer | — | mapper 两阶段联动 (列表走 IssueListDetailSerializer) | ✅ |
+| `issue_inbox` | ❌ 不在 mapper 中 | ❌ 不在 mapper 中 | — | 不生效 (仅 InboxIssueSerializer 处理) | ⚠️ 见下文 |
 
 ### 13.4 `issue_inbox` 的特殊情况
 
