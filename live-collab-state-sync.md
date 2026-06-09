@@ -313,7 +313,213 @@ Issue 描述不走 Hocuspocus 协作编辑，而是使用 [DescriptionInput](fil
 
 ---
 
-## 四、Hocuspocus 支持的文档类型
+## 四、服务端 PATCH 保存后的事件链路
+
+### 4.1 PATCH 入口与响应
+
+Issue 字段修改有**两条 API 入口**，行为不同：
+
+| 入口 | 文件 | 返回值 | 前端调用方 |
+|------|------|--------|-----------|
+| `IssueViewSet.partial_update` | [base.py#L616-L701](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/app/views/issue/base.py#L616-L701) | **`204 No Content`**（无 body） | web 前端主流程 |
+| `IssueDetailAPIEndpoint.patch` | [issue.py#L739-L795](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/api/views/issue.py#L739-L795) | **`200 serializer.data`**（完整序列化） | 外部 API / PUT 接口 |
+
+**前端 web 走的是 `IssueViewSet`**，返回 `204 No Content`——这意味着：
+
+1. PATCH 响应**不携带**服务端计算后的字段值（如 `updated_at`、`completed_at`、`sequence_id`）
+2. 前端 `issueUpdate()` 的 `await this.issueService.patchIssue(...)` 仅获知成功/失败，**无法**用响应体回写 `issuesMap`
+3. `issuesMap` 中的数据一直是步骤 ② 乐观写入的值，直到 SWR revalidation 或手动刷新拉回最新数据
+
+> 注意：外部 API 入口 `IssueDetailAPIEndpoint.patch` 返回完整的 `serializer.data`，但前端 web 不调用此接口。
+
+### 4.2 PATCH 保存后的四条异步链路
+
+`IssueViewSet.partial_update` 在 `serializer.save()` 成功后，触发以下四条 Celery 异步任务链路（`skip_activity=True` 且为描述更新时跳过全部链路）：
+
+```
+serializer.save()
+  │
+  ├─① issue_activity.delay(type="issue.activity.updated", ..., notification=True, origin=base_host)
+  │    └─ Celery 异步
+  │
+  ├─② model_activity.delay(model_name="issue", ..., origin=base_host)
+  │    └─ Celery 异步
+  │
+  └─③ issue_description_version_task.delay(updated_issue=current_instance, ...)
+       └─ Celery 异步
+```
+
+#### 链路 ①：`issue_activity` — 活动记录 + 通知投递
+
+**代码**：[issue_activities_task.py#L1503-L1603](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/issue_activities_task.py#L1503-L1603)
+
+执行步骤：
+
+1. **Redis 写入**：如果传了 `origin`，将 `issue_id → origin` 写入 Redis，**TTL=600s**（10 分钟）。用途：后续 email 通知中的链接需要知道请求来源域名（`origin`），存在 Redis 里供 `email_notification_task` 读取。
+2. **更新 `issue.updated_at`**：直接 `issue.updated_at = timezone.now(); issue.save(update_fields=["updated_at"])`。这是服务端对 `updated_at` 的权威刷新。
+3. **字段级 diff → 创建 `IssueActivity` 记录**：通过 `update_issue_activity` 逐字段比对 `requested_data` 和 `current_instance`，为每个变更字段创建一条 `IssueActivity`。比对的字段有：`name`、`parent_id`、`priority`、`state_id`、`description_html`、`target_date`、`start_date`、`label_ids`、`assignee_ids`、`estimate_point`、`archived_at`、`closed_to`。
+4. **`bulk_create` 写入**：一次性写入所有 `IssueActivity` 记录到数据库。
+5. **触发通知任务**（`notification=True` 时）：调用 `notifications.delay(...)` → 链路 ①-①。
+
+**链路 ①-①：`notifications` — 通知投递**
+
+**代码**：[notification_task.py#L190-L671](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/notification_task.py#L190-L671)
+
+执行步骤：
+
+1. **提取 @mention**：从 `description_html` 中解析 `<mention-component>` 标签，diff 出新增和移除的 mention。
+2. **mention 自动订阅**：被 mention 的用户自动成为 `IssueSubscriber`。
+3. **订阅者通知**：排除 actor 自己和已被 mention 的用户，向剩余订阅者批量创建 `Notification` 记录（in-app 通知）。
+4. **mention 通知**：向被 mention 的用户创建 `Notification` 记录，sender 为 `in_app:issue_activities:mentioned`。
+5. **邮件通知**：根据 `UserNotificationPreference` 配置（`state_change`、`issue_completed`、`comment`、`property_change`、`mention`），批量创建 `EmailNotificationLog` 记录，供 `email_notification_task` 异步发送。
+6. **`bulk_create`**：一次性写入 `Notification` 和 `EmailNotificationLog`。
+
+**对前端实时同步的影响**：
+
+- `Notification` 记录会出现在前端的通知铃铛（inbox）中，但这是**独立的拉取通道**，不会触发 Issue 详情页字段刷新。
+- `IssueActivity` 记录会被前端 `fetchActivities()` 拉取并显示在活动流中。`IssueDetail.updateIssue()` 在 PATCH 成功后会 `Promise.all([issueUpdate, fetchActivities])`，所以编辑者自己能看到活动流更新。但其他用户的 `fetchActivities` 不受触发——他们需要 SWR revalidation。
+- `issue.updated_at` 的更新不会推送到前端，只有 GET 请求才能拿到新值。
+
+#### 链路 ②：`model_activity` — Webhook 投递
+
+**代码**：[webhook_task.py#L471-L513](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/webhook_task.py#L471-L513)
+
+执行步骤：
+
+1. **逐字段 diff**：遍历 `requested_data` 中的每个 key，与 `current_instance` 比对。
+2. **每个变更字段触发一个 `webhook_activity.delay()`**：如 `state_id` 变更会触发一个 `webhook_activity`，`priority` 变更再触发一个。
+
+**链路 ②-①：`webhook_activity` — Webhook 筛选与分发**
+
+**代码**：[webhook_task.py#L385-L468](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/webhook_task.py#L385-L468)
+
+执行步骤：
+
+1. **筛选 Webhook**：查询 `Webhook.objects.filter(workspace__slug=slug, is_active=True, issue=True)` 找到所有订阅了 issue 事件的 webhook。
+2. **对每个 webhook 触发 `webhook_send_task.delay()`**。
+
+**链路 ②-②：`webhook_send_task` — HTTP POST 投递**
+
+**代码**：[webhook_task.py#L254-L382](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/webhook_task.py#L254-L382)
+
+执行步骤：
+
+1. **构建 payload**：包含 `event`、`action`、`webhook_id`、`workspace_id`、`data`（完整 issue 序列化）、`activity`（字段变更详情）。
+2. **HMAC 签名**：如果 webhook 有 `secret_key`，用 HMAC-SHA256 签名放入 `X-Plane-Signature` header。
+3. **HTTP POST**：向 webhook URL 发送请求，超时 30s。
+4. **记录日志**：将请求/响应日志写入 MongoDB（`webhook_logs` 集合），失败回退到 PostgreSQL `WebhookLog` 表。
+5. **重试与停用**：最多重试 5 次（`max_retries=5`，`retry_backoff=600s`），全部失败后停用 webhook 并发邮件通知创建者。
+
+**对前端实时同步的影响**：
+
+- ❌ **完全不影响前端**。Webhook 是外部投递机制，向第三方系统推送变更事件。
+- Webhook 的 `data` 字段包含完整 issue 序列化数据，但只发给外部 HTTP 端点，不发给 Plane 前端。
+- Webhook 投递失败不会回滚 issue 更新——issue 已经持久化成功。
+
+#### 链路 ③：`issue_description_version_task` — 描述版本记录
+
+**代码**：[issue_description_version_task.py#L43-L78](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/issue_description_version_task.py#L43-L78)
+
+执行步骤：
+
+1. **比较 `description_html`**：如果 `description_html` 没有实际变化则跳过。
+2. **合并或新建版本**：如果最新版本是同一用户在 600 秒内编辑的，则更新该版本；否则创建新的 `IssueDescriptionVersion` 记录。
+3. **写入数据库**：保存 `description_json`、`description_html`、`description_binary`、`description_stripped`。
+
+**对前端实时同步的影响**：
+
+- ❌ **完全不影响前端**。这是纯粹的审计/版本历史功能，前端通过独立的"历史版本"页面拉取 `IssueDescriptionVersion`，不参与实时同步。
+
+### 4.3 Redis 在 Issue 事件中的角色
+
+Redis 在 API 服务端的 Issue 链路中**仅做一件事**：存储 `issue_id → origin` 映射（TTL=600s），供 `email_notification_task` 生成邮件中的链接。
+
+```python
+# issue_activities_task.py#L1528-L1531
+if origin:
+    ri = redis_instance()
+    ri.set(str(issue_id), origin, ex=600)
+```
+
+这与 live server 中的 Redis 用途完全不同：
+- **API 服务端 Redis**：仅存储 `issue_id → origin`（通知邮件用），是 key-value 缓存。
+- **Live server Redis**：Hocuspocus 扩展用 Redis Pub/Sub 做跨节点 Y.js 更新和 stateless 消息广播。
+
+两者共享同一个 Redis 实例，但使用不同的 key 空间和机制（一个用 `SET/GET`，一个用 `Pub/Sub`），互不干扰。
+
+### 4.4 事件链路对前端实时同步的影响汇总
+
+| 链路 | 目的 | 写入目标 | 影响前端实时同步？ | 影响方式 |
+|------|------|----------|-------------------|----------|
+| `issue_activity` → `IssueActivity` | 活动记录（审计） | PostgreSQL | **间接** | 编辑者的 `fetchActivities()` 可拉到新记录；其他用户需等 SWR revalidation |
+| `issue_activity` → `notifications` | 通知投递 | PostgreSQL `Notification` + `EmailNotificationLog` | **间接** | 通知铃铛可拉到新通知，但不触发 Issue 详情刷新 |
+| `issue_activity` → `issue.updated_at` 更新 | 时间戳刷新 | PostgreSQL | **间接** | 仅通过后续 GET 才能拿到新 `updated_at` |
+| `issue_activity` → Redis `issue_id:origin` | 邮件链接域名 | Redis | ❌ | 仅通知邮件用 |
+| `model_activity` → `webhook_activity` → `webhook_send_task` | Webhook 外部投递 | MongoDB/PostgreSQL 日志 | ❌ | 外部系统推送 |
+| `issue_description_version_task` | 描述版本历史 | PostgreSQL | ❌ | 独立版本页面拉取 |
+
+### 4.5 PATCH 响应、后续拉取与其他客户端本地状态的关系
+
+#### 4.5.1 编辑者（User A）的状态时序
+
+```
+t0: 乐观更新 issuesMap[id].state_id = "closed"    → UI 立即更新
+t1: PATCH /api/.../issues/:id/ → 服务端 serializer.save()  → DB 写入 "closed"
+t2: 服务端返回 204 No Content                        → 前端获知成功
+t3: fetchParentStats() + fetchActivities() 并行执行
+    - fetchParentStats: GET /api/.../analytics/     → 刷新父级统计
+    - fetchActivities: GET /api/.../activities/     → 拉回新 IssueActivity 记录
+t4: [Celery 异步] issue_activity.delay()              → DB 写入 IssueActivity + Notification
+t5: [Celery 异步] model_activity.delay()              → 外部 Webhook 投递
+t6: [Celery 异步] issue_description_version_task.delay() → 描述版本记录
+```
+
+**关键问题**：
+- `t2` 返回 204，没有 body，前端无法用响应体修正 `issuesMap` 中与服务端不一致的字段（如 `updated_at`）
+- `t3` 的 `fetchActivities` 能拉到活动记录，但活动记录不包含 issue 的完整字段——不能用于修正 `issuesMap`
+- `t4-t6` 全部是 Celery 异步任务，与前端请求-响应周期完全解耦
+
+#### 4.5.2 其他用户（User B）的状态时序
+
+```
+t1: User A PATCH → 服务端 DB 写入 "closed"
+t4: [Celery] IssueActivity + Notification 写入 DB
+t?: User B 切换标签页回来 → SWR revalidateOnFocus
+    → fetchIssueWithIdentifier() → GET /api/.../issues/:id/
+    → 服务端返回最新数据（state_id="closed", updated_at=新时间戳）
+    → addIssue() → { ...prevIssue, ...serverIssue } 浅合并覆盖
+    → UI 更新：state_id 从 "open" 跳变为 "closed"
+```
+
+**关键问题**：
+- User B 感知 User A 的修改**完全依赖** SWR revalidation 或手动刷新，没有推送通道
+- 如果 User B 也正在修改同一 issue，`addIssue` 的浅合并会用服务端全量数据覆盖 User B 的本地未提交修改
+- User B 的通知铃铛可能在 SWR revalidation 之前就显示"state 变更"通知（因为 `Notification` 记录已经创建），但 Issue 详情页仍显示旧值——**通知和详情不一致**
+
+#### 4.5.3 PATCH 响应与后续拉取的竞态
+
+```
+时间线（User A）：
+  t0: 乐观更新 state_id = "closed"
+  t1: PATCH 请求发出
+  t2: [网络延迟] PATCH 尚未到达服务端
+  t3: User A 切换标签页后切回 → SWR revalidateOnFocus
+  t4: GET /api/.../issues/:id/ → 返回旧值 state_id = "open"（PATCH 尚未写入）
+  t5: addIssue() 浅合并 → issuesMap 被覆盖为 "open" → 闪烁！
+  t6: PATCH 到达服务端 → DB 写入 "closed"
+  t7: 下次 SWR revalidation → GET 返回 "closed" → 再次闪烁！
+```
+
+**根因**：`issueUpdate()` 不等待 PATCH 响应就触发后续数据拉取。SWR 的 `revalidateOnFocus` 可能在 PATCH 完成前就触发 GET，拉回旧值覆盖乐观更新。
+
+可能的缓解策略（代码中尚未实现）：
+1. PATCH 成功后立即用服务端响应回写 `issuesMap`——但当前返回 204，无 body 可用
+2. PATCH 进行中时暂时禁用 SWR revalidation——需要修改 SWR 配置
+3. 将 `IssueViewSet.partial_update` 改为返回 `200 serializer.data`——让前端能用响应体修正本地状态
+
+---
+
+## 五、Hocuspocus 支持的文档类型
 
 当前 Hocuspocus live server 仅支持 `project_page` 类型（[handler.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/live/src/services/page/handler.ts)）：
 
@@ -330,7 +536,7 @@ export const getPageService = (documentType: TDocumentTypes, context: HocusPocus
 
 ---
 
-## 五、数据流汇总图
+## 六、数据流汇总图
 
 ### Page 文档协作（有实时通道）
 
@@ -384,7 +590,7 @@ issueOperations.update() → BaseIssuesStore.issueUpdate()
 
 ---
 
-## 六、关键文件索引
+## 七、关键文件索引
 
 | 模块 | 文件 | 作用 |
 |------|------|------|
@@ -422,3 +628,10 @@ issueOperations.update() → BaseIssuesStore.issueUpdate()
 | 类型定义 | [types/index.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/live/src/types/index.ts) | HocusPocus 上下文类型 |
 | Issue 版本 | [issue_version_sync.py](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/issue_version_sync.py) | Issue 版本记录 (非实时) |
 | Redis 管理 | [redis.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/live/src/redis.ts) | Redis 连接管理 (reconnect策略) |
+| **服务端 Issue PATCH** | [base.py](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/app/views/issue/base.py) | `IssueViewSet.partial_update` (返回 204) |
+| **服务端 Issue PATCH (API)** | [issue.py](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/api/views/issue.py) | `IssueDetailAPIEndpoint.patch` (返回 200+body) |
+| **活动记录任务** | [issue_activities_task.py](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/issue_activities_task.py) | 字段级 diff + IssueActivity 创建 + 通知触发 |
+| **Webhook 任务** | [webhook_task.py](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/webhook_task.py) | model_activity → webhook_activity → webhook_send_task |
+| **通知任务** | [notification_task.py](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/notification_task.py) | Notification + EmailNotificationLog 创建 |
+| **描述版本任务** | [issue_description_version_task.py](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/bgtasks/issue_description_version_task.py) | IssueDescriptionVersion 审计记录 |
+| **API Redis** | [redis.py](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/settings/redis.py) | API 端 Redis 连接 (issue_id→origin 缓存) |
