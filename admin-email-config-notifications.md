@@ -80,7 +80,68 @@ SKIP_ENV_VAR = os.environ.get("SKIP_ENV_VAR", "1") == "1"
 | **生效时机** | 每次 Celery 任务调用 `get_email_configuration()` 时从 DB 实时读取，无需重启服务 |
 | **不涉及的层** | Django `settings.EMAIL_BACKEND` 在 [common.py#L277](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/settings/common.py#L277) 中硬编码为 `"django.core.mail.backends.smtp.EmailBackend"`，不可热修改 |
 | **缓存影响** | GET 请求的配置有 2 小时 Redis 缓存，但写入时自动失效；邮件发送不走缓存，直接读 DB |
-| **禁用邮件** | [DisableEmailFeatureEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/license/api/views/configuration.py#L62-L85) 的 DELETE 方法会将 `ENABLE_SMTP` 设为 `"0"`，其余 SMTP 字段清空 |
+| **禁用邮件** | [DisableEmailFeatureEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/license/api/views/configuration.py#L62-L85) 的 DELETE 方法清理 6 个字段（详见 2.5 节），`EMAIL_USE_TLS` / `EMAIL_USE_SSL` **不会被清理** |
+
+### 2.5 禁用邮件接口的字段清理细节
+
+[DisableEmailFeatureEndpoint.delete](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/license/api/views/configuration.py#L62-L85) 使用一条 `Case/When` SQL 批量更新，精确行为如下：
+
+```python
+InstanceConfiguration.objects.filter(
+    Q(key__in=[
+        "EMAIL_HOST",
+        "EMAIL_HOST_USER",
+        "EMAIL_HOST_PASSWORD",
+        "ENABLE_SMTP",
+        "EMAIL_PORT",
+        "EMAIL_FROM",
+    ])
+).update(value=Case(When(key="ENABLE_SMTP", then=Value("0")), default=Value("")))
+```
+
+**清理的字段（6 个）**：
+
+| Key | 更新后的值 |
+|-----|-----------|
+| `EMAIL_HOST` | `""` (空字符串) |
+| `EMAIL_HOST_USER` | `""` (空字符串) |
+| `EMAIL_HOST_PASSWORD` | `""` (空字符串) |
+| `EMAIL_PORT` | `""` (空字符串) |
+| `EMAIL_FROM` | `""` (空字符串) |
+| `ENABLE_SMTP` | `"0"` |
+
+**未清理的字段（2 个）**：
+
+| Key | 保留值 | 运维影响 |
+|-----|--------|---------|
+| `EMAIL_USE_TLS` | 原值不变（如 `"1"`） | 重新启用 SMTP 时无需再次配置 TLS |
+| `EMAIL_USE_SSL` | 原值不变（如 `"0"`） | 同上 |
+
+**禁用后的实际保护机制**：后端没有任何代码在发送前检查 `ENABLE_SMTP` 的值（见 2.6 节分析）。禁用之所以生效，是因为 `EMAIL_HOST` 被清空为 `""`，导致 `get_connection(host="")` 在尝试连接时抛出 `SMTPConnectError`，被 `except Exception` 捕获后静默返回。这是一种**隐式保护**，而非显式的开关判断。
+
+**残留配置风险**：禁用后 `EMAIL_USE_TLS` / `EMAIL_USE_SSL` 保留在 DB 中，且 `EMAIL_HOST_PASSWORD` 被清为 `""`（不是 `None`），解密后返回空字符串。若运维人员仅修改 `EMAIL_HOST` 而忘记重填密码，会导致认证失败。
+
+### 2.6 ENABLE_SMTP 开关对发送逻辑的影响
+
+对整个代码库进行 `ENABLE_SMTP` 关键字搜索后，确认其仅在以下 3 处出现：
+
+| 位置 | 用途 |
+|------|------|
+| [smtp_config_variables 定义](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/utils/instance_config_variables/core.py#L148-L153) | 定义配置项及默认值 `"0"` |
+| [DisableEmailFeatureEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/license/api/views/configuration.py#L68-L79) | 禁用时设为 `"0"` |
+| [Admin UI 页面](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/admin/app/(all)/(dashboard)/email/page.tsx#L54-L58) | 读取值控制 Toggle 开关显示 |
+
+**结论**：`ENABLE_SMTP` 在所有后端邮件发送路径（`get_email_configuration()`、Celery 任务、视图层）中均**未被读取或判断**。它是一个纯 UI 层开关，仅控制 Admin 界面的表单显示/隐藏。
+
+具体来说，以下所有调用点都不检查 `ENABLE_SMTP`：
+- [forgot_password.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/views/app/password_management.py#L87) — 无条件触发
+- [magic_link.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/views/app/magic.py#L54) — 无条件触发
+- [workspace_invitation.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/workspace/invite.py#L121) — 无条件触发
+- [project_invitations.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L105) — 无条件触发
+- [project_add_user_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/member.py#L144) — 无条件触发
+- [user_activation_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/adapter/base.py#L230) — 无条件触发
+- [user_deactivation_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/user/base.py#L343) — 无条件触发
+- [stack_email_notification](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/bgtasks/email_notification_task.py#L46-L84) — Beat 定时无条件触发
 
 ---
 
@@ -290,11 +351,13 @@ Plane 的邮件发送分为两种截然不同的模式：
 | 维度 | 即时发送模式 | Issue 通知模式 |
 |------|------------|--------------|
 | 自动重试 | **无** | **无** |
-| 手动重试 | 不支持 | `processed_at=None` 的记录会在下个 5 分钟周期重新被 `stack_email_notification` 捡起（但 `processed_at` 已被标记） |
+| 手动重试 | 不支持 | **不支持**（见下方分析） |
 | 失败标记 | 无 | `sent_at` 保持 `None` |
 | 日志记录 | `log_exception(e)` → 标准错误日志 | `log_exception(e)` + `sent_at=None` |
 
 **重要发现**：Issue 通知模式在 `stack_email_notification` 阶段就把 `processed_at` 标记了，即使后续 `send_email_notification` 失败，这些记录也不会被重新处理。因此实际上 **Plane 的邮件系统没有真正的自动重试机制**。
+
+**失败日志不可重新投递**：`stack_email_notification` 的查询条件为 `processed_at__isnull=True`，一旦记录被标记 `processed_at`（无论后续发送是否成功），就**永远不会再被** `stack_email_notification` 选取。因此 `processed_at≠None, sent_at=None` 的记录是一种"死信"状态——它标识了发送失败，但没有任何代码路径能将其重新投递。若需手动重试，运维人员需要直接操作数据库将这些记录的 `processed_at` 重置为 `NULL`。
 
 唯一的例外是 **Webhook 发送**（[webhook_send_task](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/bgtasks/webhook_task.py#L254-L382)），它配置了：
 
@@ -330,8 +393,24 @@ Plane 的邮件发送分为两种截然不同的模式：
 
 **回看状态判断**：
 - `processed_at=None` → 尚未处理（等待下一个 5 分钟聚合周期）
-- `processed_at≠None, sent_at=None` → 已处理但发送失败
+- `processed_at≠None, sent_at=None` → **死信状态**：已处理但发送失败，无法自动重新投递
 - `sent_at≠None` → 发送成功
+
+**死信记录的重新投递方式**（需运维手动操作数据库）：
+
+```sql
+-- 查询所有发送失败的记录
+SELECT id, receiver_id, entity_identifier, processed_at, sent_at
+FROM email_notification_logs
+WHERE processed_at IS NOT NULL AND sent_at IS NULL;
+
+-- 重置为未处理状态，使其在下一个 Beat 周期被重新拾取
+UPDATE email_notification_logs
+SET processed_at = NULL
+WHERE processed_at IS NOT NULL AND sent_at IS NULL;
+```
+
+**注意**：手动重置后，这些记录会在下一个 5 分钟 Beat 周期被 `stack_email_notification` 重新聚合并发送。但如果失败原因未解决（如 SMTP 配置错误），它们会再次进入死信状态。
 
 #### 日志清理
 
@@ -422,7 +501,7 @@ Plane 的邮件发送分为两种截然不同的模式：
 
 1. **配置热加载**：在 Admin UI 修改 SMTP 配置后，下一个 Celery 任务执行时即生效，无需重启任何服务。但 `EMAIL_BACKEND` 本身是硬编码的，不可通过 UI 切换。
 
-2. **ENABLE_SMTP 开关**：虽然配置可以热加载，但代码中**并未检查 `ENABLE_SMTP` 的值**来决定是否发送邮件。`ENABLE_SMTP` 仅影响 Admin UI 的表单显示/隐藏。禁用后需确认所有邮件任务不会被触发。
+2. **ENABLE_SMTP 不是安全开关**：`ENABLE_SMTP` 在所有后端发送路径中均**未被检查**（源码证据见 2.6 节）。禁用之所以生效，是因为 `DisableEmailFeatureEndpoint` 同时清空了 `EMAIL_HOST`，导致 SMTP 连接失败。若有人仅将 `ENABLE_SMTP` 设为 `"0"` 而不清理 `EMAIL_HOST`，邮件仍会正常发送。运维接入邮件网关时，**不应依赖 `ENABLE_SMTP` 做流量控制**，应在网关侧配置策略。
 
 3. **无重试机制**：所有邮件任务都没有 `autoretry_for` 配置。接入邮件网关时需确保网关本身的高可用性，或在网关前部署重试队列（如 Postfix 的 `deferred` 队列）。
 
@@ -430,6 +509,10 @@ Plane 的邮件发送分为两种截然不同的模式：
 
 5. **密码加密**：`EMAIL_HOST_PASSWORD` 使用 Fernet 加密存储，密钥派生自 Django `SECRET_KEY`。更换 `SECRET_KEY` 会导致已存储的密码无法解密，需重新配置。
 
-6. **TLS/SSL 互斥**：前端 [email-config-form.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/admin/app/(all)/(dashboard)/email/email-config-form.tsx#L132-L145) 强制 TLS 和 SSL 互斥选择，后端在 `get_connection()` 时通过 `use_tls=EMAIL_USE_TLS == "1"` 转换为布尔值。
+6. **TLS/SSL 互斥**：前端 [email-config-form.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/admin/app/(all)/(dashboard)/email/email-config-form.tsx#L132-L145) 强制 TLS 和 SSL 互斥选择，后端在 `get_connection()` 时通过 `use_tls=EMAIL_USE_TLS == "1"` 转换为布尔值。禁用邮件时 `EMAIL_USE_TLS` / `EMAIL_USE_SSL` 不会被清理（见 2.5 节），重新启用 SMTP 时 TLS/SSL 配置会自动恢复，但其余 5 个字段（`EMAIL_HOST`、`EMAIL_PORT`、`EMAIL_HOST_USER`、`EMAIL_HOST_PASSWORD`、`EMAIL_FROM`）需要重新填写。
 
 7. **日志保留**：`EmailNotificationLog` 在 `sent_at` 超过 30 天后由定时任务清理，清理前会尝试归档到 MongoDB。可通过 `HARD_DELETE_AFTER_DAYS` 环境变量调整保留天数。
+
+8. **死信重投递**：`processed_at≠None, sent_at=None` 的记录处于"死信"状态，无自动重投递路径。运维可通过 SQL 将 `processed_at` 重置为 `NULL` 手动重投递（见 4.3 节），但需先确保 SMTP 配置已恢复正常，否则会再次进入死信。
+
+9. **禁用后的静默失败**：禁用邮件后，所有发送任务仍会被触发并执行，只是因 `EMAIL_HOST=""` 导致连接失败后静默返回。Celery Worker 日志中会出现大量 `SMTPConnectError`，但不会影响业务流程（如邀请创建、密码重置请求仍会返回 200）。
