@@ -10,6 +10,14 @@ Plane 的附件系统采用 **客户端直传 + 服务端签名 + 元数据关�
 
 核心模型为 `FileAsset`，通过 `entity_type` 区分不同业务场景（工单附件、描述内嵌图片、评论图片等），通过外键关联到 `Issue`、`Comment`、`Page` 等实体。
 
+附件相关的后端端点分布在三个层面：
+
+| 层面 | URL 前缀 | 代码位置 | 服务对象 |
+|------|----------|----------|----------|
+| App 侧 | `/api/assets/v2/...` | `apps/api/plane/app/views/issue/attachment.py` + `apps/api/plane/app/views/asset/v2.py` | 前端 Web/Admin |
+| API 侧（旧路径） | `/api/workspaces/.../issue-attachments/` | `apps/api/plane/api/views/issue.py` | 外部 API 消费者 |
+| API 侧（新路径） | `/api/workspaces/.../work-items/.../attachments/` | 同上 | 外部 API 消费者 |
+
 ---
 
 ## 2. 前端上传流程
@@ -138,9 +146,230 @@ PATCH /api/assets/v2/workspaces/{slug}/projects/{projectId}/{serviceType}/{issue
 
 ---
 
-## 5. 下载与访问控制
+## 5. 三组附件端点的完整行为对比
 
-### 5.1 权限装饰器 `allow_permission`
+Plane 的附件操作涉及三组端点，分别服务于 Web 前端和外部 API 消费者。它们的权限机制和查询逻辑存在显著差异。
+
+### 5.1 端点分组与 URL 路径
+
+**App 侧 issue-attachments（V2）**
+
+代码：`apps/api/plane/app/views/issue/attachment.py` → `IssueAttachmentV2Endpoint`
+
+```
+POST   /api/assets/v2/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/attachments/
+GET    /api/assets/v2/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/attachments/          (列表)
+GET    /api/assets/v2/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/attachments/{pk}/      (下载)
+PATCH  /api/assets/v2/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/attachments/{pk}/      (确认上传)
+DELETE /api/assets/v2/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/attachments/{pk}/
+```
+
+**App 侧 issue-attachments（V1，已弃用但路由仍存在）**
+
+代码：`apps/api/plane/app/views/issue/attachment.py` → `IssueAttachmentEndpoint`
+
+```
+POST   /api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/
+GET    /api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/
+DELETE /api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/{pk}/
+```
+
+**API 侧 work-items/attachments**
+
+代码：`apps/api/plane/api/views/issue.py` → `IssueAttachmentListCreateAPIEndpoint` + `IssueAttachmentDetailAPIEndpoint`
+
+旧路径：
+```
+POST   /api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/
+GET    /api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/
+GET    /api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/{pk}/
+PATCH  /api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/{pk}/
+DELETE /api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/{pk}/
+```
+
+新路径：
+```
+POST   /api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/
+GET    /api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/
+GET    /api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/{pk}/
+PATCH  /api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/{pk}/
+DELETE /api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/{pk}/
+```
+
+> 旧路径和新路径指向同一个 Endpoint 类，行为完全相同。
+
+### 5.2 上传（POST）行为对比
+
+| 维度 | App V2 (`IssueAttachmentV2Endpoint`) | API 侧 (`IssueAttachmentListCreateAPIEndpoint`) |
+|------|--------------------------------------|------------------------------------------------|
+| **权限机制** | `@allow_permission([ADMIN, MEMBER, GUEST])`，PROJECT 级别 | `user_has_issue_permission(issue=issue, allow_creator=True, allowed_roles=[ADMIN, MEMBER, GUEST])` |
+| **issue 存在性校验** | ❌ 不校验 issue 是否存在 | ✅ 先 `Issue.objects.get(pk=issue_id, ...)` 校验 issue 存在 |
+| **creator 规则** | ❌ 不允许非项目成员的 issue 创建者上传 | ✅ `allow_creator=True`：若用户是 issue 创建者，即使不是项目成员也可上传 |
+| **MIME 校验** | ✅ `ATTACHMENT_MIME_TYPES` 白名单 | ✅ `ATTACHMENT_MIME_TYPES` 白名单 |
+| **外部集成** | ❌ 不支持 | ✅ 支持 `external_id` + `external_source` 去重 |
+| **文件名校验** | `sanitize_filename`，空名默认 `"unnamed"` | `sanitize_filename`，空名直接报 400 |
+
+### 5.3 列表（GET 列表）行为对比
+
+| 维度 | App V2 | API 侧 |
+|------|--------|---------|
+| **权限机制** | `@allow_permission([ADMIN, MEMBER, GUEST])`，PROJECT 级别 | `@allow_permission([ADMIN, MEMBER, GUEST])`，PROJECT 级别 |
+| **查询条件** | `issue_id` + `entity_type=ISSUE_ATTACHMENT` + `workspace__slug` + `project_id` + `is_uploaded=True` | 同 App V2 |
+| **issue_id 过滤** | ✅ 用于过滤结果 | ✅ 用于过滤结果 |
+
+### 5.4 下载（GET 单个）行为对比
+
+| 维度 | App V2 | API 侧 |
+|------|--------|---------|
+| **权限机制** | `@allow_permission([ADMIN, MEMBER, GUEST])`，PROJECT 级别 | `user_has_issue_permission(issue=None, allowed_roles=None, allow_creator=False)` |
+| **API 侧权限语义** | — | `issue=None` → 不校验具体 issue；`allowed_roles=None` → 不限制角色；`allow_creator=False` → 不检查创建者。实质等价于：**只要是项目成员即可** |
+| **查询条件** | `id=pk, workspace__slug=slug, project_id=project_id` | `id=pk, workspace__slug=slug, project_id=project_id` |
+| **issue_id 过滤** | ❌ 不含 | ❌ 不含 |
+| **is_uploaded 校验** | ✅ 未上传返回 400 | ✅ 未上传返回 400 |
+
+### 5.5 上传确认（PATCH）行为对比
+
+| 维度 | App V2 | API 侧 |
+|------|--------|---------|
+| **权限机制** | `@allow_permission([ADMIN, MEMBER, GUEST])`，PROJECT 级别 | `user_has_issue_permission(issue=issue, allow_creator=True, allowed_roles=[ADMIN, MEMBER, GUEST])` |
+| **issue 存在性校验** | ❌ 不校验 | ✅ 先校验 issue 存在 |
+| **查询条件** | `pk=pk, workspace__slug=slug, project_id=project_id` | `pk=pk, workspace__slug=slug, project_id=project_id` |
+| **issue_id 过滤** | ❌ 不含 | ❌ 不含 |
+| **creator 规则** | ❌ 不允许非项目成员的 issue 创建者确认 | ✅ `allow_creator=True`：issue 创建者可确认上传 |
+
+### 5.6 删除（DELETE）行为对比
+
+| 维度 | App V1 | App V2 | API 侧 |
+|------|--------|--------|---------|
+| **权限机制** | `@allow_permission([ADMIN], creator=True, model=FileAsset)` | `@allow_permission([ADMIN], creator=True, model=FileAsset)` | `user_has_issue_permission(issue=issue, allow_creator=True, allowed_roles=[ADMIN, MEMBER, GUEST])` |
+| **查询条件** | `pk=pk, workspace__slug=slug, project_id=project_id, issue_id=issue_id` | `pk=pk, workspace__slug=slug, project_id=project_id` | `pk=pk, workspace__slug=slug, project_id=project_id` |
+| **issue_id 过滤** | ✅ V1 含 issue_id | ❌ V2 不含 | ❌ 不含 |
+| **删除方式** | 硬删除（`asset.delete()` + DB 删除） | 软删除（`is_deleted=True`） | 软删除（`is_deleted=True`） |
+| **creator 规则** | ADMIN 或 `created_by=request.user` | ADMIN 或 `created_by=request.user` | 项目成员 (ADMIN/MEMBER/GUEST) 或 issue 创建者 |
+| **角色范围** | 仅 ADMIN + 创建者 | 仅 ADMIN + 创建者 | **所有角色 (ADMIN/MEMBER/GUEST) + 创建者** — 角色范围更宽 |
+
+### 5.7 关键差异总结
+
+**1. API 侧独有的 `user_has_issue_permission` 函数**
+
+`apps/api/plane/api/views/issue.py` 中的 `user_has_issue_permission` 定义为：
+
+```python
+def user_has_issue_permission(user_id, project_id, issue=None, allowed_roles=None, allow_creator=True):
+    if allow_creator and issue is not None and user_id == issue.created_by_id:
+        return True
+    qs = ProjectMember.objects.filter(project_id=project_id, member_id=user_id, is_active=True)
+    if allowed_roles is not None:
+        qs = qs.filter(role__in=allowed_roles)
+    return qs.exists()
+```
+
+该函数与 App 侧的 `@allow_permission` 装饰器有两个关键区别：
+- **issue 创建者优先**：当 `allow_creator=True` 且 `issue is not None` 时，issue 创建者即使不是项目成员也被放行。这在 `@allow_permission` 中不存在——`allow_permission` 的 creator 规则要求**同时是工作区成员且是资源创建者**。
+- **`issue=None` 的降级行为**：下载端点传 `issue=None`，此时 `allow_creator` 分支不生效，退化为纯项目成员校验。
+
+**2. V1 端点是唯一在 DELETE 查询中包含 issue_id 的版本**
+
+```python
+# V1 (IssueAttachmentEndpoint.delete)
+issue_attachment = FileAsset.objects.filter(
+    pk=pk, workspace__slug=slug, project_id=project_id, issue_id=issue_id
+).first()
+
+# V2 (IssueAttachmentV2Endpoint.delete)
+issue_attachment = FileAsset.objects.get(
+    pk=pk, workspace__slug=slug, project_id=project_id
+)
+```
+
+V1 的 DELETE 操作在数据库查询层面限制了 asset 必须属于指定 issue，但 V1 已为弃用路径，且执行硬删除。
+
+**3. API 侧 DELETE 的角色范围更宽**
+
+App V2 的 DELETE 仅允许 ADMIN 或资源创建者，API 侧则允许所有项目角色（ADMIN/MEMBER/GUEST）加上 issue 创建者。这意味着 GUEST 用户在 API 侧可以删除附件，但在 App V2 侧不行。
+
+---
+
+## 6. Project/Workspace Download 端点绕过分析
+
+### 6.1 `WorkspaceAssetDownloadEndpoint`
+
+代码：`apps/api/plane/app/views/asset/v2.py`
+
+```python
+class WorkspaceAssetDownloadEndpoint(BaseAPIView):
+    @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+    def get(self, request, slug, asset_id):
+        asset = FileAsset.objects.get(
+            id=asset_id,
+            workspace__slug=slug,
+            is_uploaded=True,
+        )
+        # ... 生成签名 URL 并 302 重定向
+```
+
+**关键发现**：该端点的查询条件**不包含 `entity_type` 过滤**，也不包含 `project_id` 过滤。这意味着：
+
+- ✅ 工作区成员可通过此端点下载**任意 entity_type** 的已上传资产，包括 `ISSUE_ATTACHMENT`
+- ✅ 无需知道 issue_id 或 project_id
+- ✅ 仅需工作区成员身份 + asset_id
+
+### 6.2 `ProjectAssetDownloadEndpoint`
+
+```python
+class ProjectAssetDownloadEndpoint(BaseAPIView):
+    @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="PROJECT")
+    def get(self, request, slug, project_id, asset_id):
+        asset = FileAsset.objects.get(
+            id=asset_id,
+            workspace__slug=slug,
+            project_id=project_id,
+            is_uploaded=True,
+        )
+        # ... 生成签名 URL 并 302 重定向
+```
+
+**关键发现**：该端点的查询条件**同样不包含 `entity_type` 过滤**，也不包含 `issue_id`。这意味着：
+
+- ✅ 项目成员可通过此端点下载该项目的**任意 entity_type** 资产，包括 `ISSUE_ATTACHMENT`
+- ✅ 无需知道 issue_id
+- ✅ 仅需项目成员身份 + project_id + asset_id
+
+### 6.3 绕过路径汇总
+
+| 正常访问路径 | 绕过路径 | 绕过所需条件 |
+|-------------|----------|-------------|
+| `IssueAttachmentV2Endpoint.get`（需 issue URL） | `ProjectAssetDownloadEndpoint.get`（仅需 project URL） | 项目成员身份 + asset_id |
+| `IssueAttachmentV2Endpoint.get`（需 issue URL） | `WorkspaceAssetDownloadEndpoint.get`（仅需 workspace URL） | 工作区成员身份 + asset_id |
+
+**影响评估**：
+
+- 由于 `asset_url` 属性生成的下载路径始终指向 `IssueAttachmentV2Endpoint`，前端正常流程不会使用 Download 端点。但在代码层面，Download 端点确实提供了不经过 issue URL 访问 `ISSUE_ATTACHMENT` 资产的通道。
+- `WorkspaceAssetDownloadEndpoint` 的权限级别为 WORKSPACE，因此**跨项目**的工作区成员也能通过此端点下载其他项目中的 `ISSUE_ATTACHMENT` 资产（只要知道 asset_id）。
+- 此行为与 `StaticFileAssetEndpoint` 不同——后者在代码中通过 `entity_type` 白名单限制为 LOGO/AVATAR/COVER 类型，而 Download 端点未做此限制。
+
+### 6.4 `WorkspaceFileAssetEndpoint` 的 GET 和 PATCH
+
+```python
+class WorkspaceFileAssetEndpoint(BaseAPIView):
+    @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+    def get(self, request, slug, asset_id):
+        asset = FileAsset.objects.get(id=asset_id, workspace__slug=slug)
+        # ... 返回序列化数据（含 asset_url 等元信息）
+
+    @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+    def patch(self, request, slug, asset_id):
+        asset = FileAsset.objects.get(id=asset_id, workspace__slug=slug)
+        # ... 更新 is_uploaded 等字段
+```
+
+这两个方法同样不区分 `entity_type`，允许工作区成员对任意类型资产执行读取元信息和确认上传操作。
+
+---
+
+## 7. 下载与访问控制
+
+### 7.1 权限装饰器 `allow_permission`
 
 `apps/api/plane/app/permissions/base.py` 中的 `allow_permission` 是附件相关端点的核心权限守卫，支持两种级别：
 
@@ -155,55 +384,66 @@ PATCH /api/assets/v2/workspaces/{slug}/projects/{projectId}/{serviceType}/{issue
 
 **creator 选项**：若 `creator=True` 且指定了 `model`，则额外允许资源创建者访问（先校验工作区成员身份，再校验 `created_by=request.user`）。
 
-### 5.2 issue_id 在附件端点中的实际作用范围
+### 7.2 `user_has_issue_permission` 函数
 
-> **核心发现：`IssueAttachmentV2Endpoint` 的单个资源操作（下载/删除/确认上传）均不基于 `issue_id` 进行权限限制。** 虽然 URL 中包含 `issue_id` 参数，但实际查询只使用 `(pk, workspace__slug, project_id)` 三元组，权限守卫也仅校验项目成员身份。这意味着：**同一项目内，任何有权限的用户均可通过构造 asset_id 访问其他工单的附件。**
+`apps/api/plane/api/views/issue.py` 中的 `user_has_issue_permission` 是 API 侧端点使用的权限函数，逻辑如下：
 
-各操作的代码证据：
-
-**GET（单个下载）** — `IssueAttachmentV2Endpoint.get`（`pk` 存在时）：
 ```python
-asset = FileAsset.objects.get(id=pk, workspace__slug=slug, project_id=project_id)
+def user_has_issue_permission(user_id, project_id, issue=None, allowed_roles=None, allow_creator=True):
+    # 1. 如果允许创建者且 issue 不为空，检查用户是否为 issue 创建者
+    if allow_creator and issue is not None and user_id == issue.created_by_id:
+        return True
+    # 2. 检查项目成员资格，可限制角色范围
+    qs = ProjectMember.objects.filter(project_id=project_id, member_id=user_id, is_active=True)
+    if allowed_roles is not None:
+        qs = qs.filter(role__in=allowed_roles)
+    return qs.exists()
 ```
-查询条件不含 `issue_id`。`@allow_permission` 仅校验项目成员身份。
 
-**PATCH（确认上传）** — `IssueAttachmentV2Endpoint.patch`：
-```python
-issue_attachment = FileAsset.objects.get(pk=pk, workspace__slug=slug, project_id=project_id)
-```
-查询条件不含 `issue_id`。
+与 `@allow_permission` 的关键区别：
 
-**DELETE** — `IssueAttachmentV2Endpoint.delete`：
-```python
-issue_attachment = FileAsset.objects.get(pk=pk, workspace__slug=slug, project_id=project_id)
-```
-查询条件不含 `issue_id`。权限通过 `@allow_permission([ROLE.ADMIN], creator=True, model=FileAsset)` 控制，允许 ADMIN 或资源创建者。
+| 维度 | `@allow_permission` | `user_has_issue_permission` |
+|------|---------------------|----------------------------|
+| creator 语义 | 资源（FileAsset）的 `created_by` | issue 的 `created_by` |
+| creator 前提 | 必须同时是工作区成员 | 无需是工作区/项目成员 |
+| 工作区 ADMIN 特权 | 项目成员 + 工作区 ADMIN 自动放行 | 无此逻辑 |
+| issue 存在性 | 不校验 | 部分操作校验（POST/PATCH/DELETE） |
 
-**GET（列表）** — `IssueAttachmentV2Endpoint.get`（`pk` 不存在时）：
-```python
-issue_attachments = FileAsset.objects.filter(
-    issue_id=issue_id,
-    entity_type=FileAsset.EntityTypeContext.ISSUE_ATTACHMENT,
-    workspace__slug=slug,
-    project_id=project_id,
-    is_uploaded=True,
-)
-```
-列表查询**使用了** `issue_id`，但仅用于过滤返回哪些附件，不是权限校验。
+### 7.3 issue_id 在附件端点中的实际作用范围
 
-**对比：API 层（`apps/api/plane/api/views/issue.py`）的 `IssueAttachmentDetailAPIEndpoint.get`**：
-```python
-if not user_has_issue_permission(
-    request.user.id,
-    project_id=project_id,
-    issue=None,           # 注意：issue=None，不校验具体 issue 权限
-    allowed_roles=None,   # allowed_roles=None，不限制角色
-    allow_creator=False,
-):
-```
-API 层同样仅校验用户是否为项目成员，不校验 issue 级别的权限。
+> **核心发现：所有端点（App V2、API 侧）的单个资源操作（下载/删除/确认上传）均不基于 `issue_id` 进行权限限制。** 虽然 URL 中包含 `issue_id` 参数，但实际查询只使用 `(pk, workspace__slug, project_id)` 三元组（App V2 / API 侧），或 `(pk, workspace__slug, project_id, issue_id)` 四元组（仅 App V1 DELETE）。
 
-### 5.3 项目内跨工单 asset 访问范围
+各操作的查询条件总结：
+
+**App V2 — `IssueAttachmentV2Endpoint`**
+
+| 操作 | 查询条件 | 含 issue_id? |
+|------|----------|-------------|
+| POST | N/A（创建时写入） | — |
+| GET 列表 | `issue_id + entity_type + workspace__slug + project_id + is_uploaded` | ✅ 用于过滤 |
+| GET 单个 | `id + workspace__slug + project_id` | ❌ |
+| PATCH | `pk + workspace__slug + project_id` | ❌ |
+| DELETE | `pk + workspace__slug + project_id` | ❌ |
+
+**App V1 — `IssueAttachmentEndpoint`**
+
+| 操作 | 查询条件 | 含 issue_id? |
+|------|----------|-------------|
+| POST | N/A（创建时写入） | — |
+| GET 列表 | `issue_id + workspace__slug + project_id` | ✅ 用于过滤 |
+| DELETE | `pk + workspace__slug + project_id + issue_id` | ✅ **V1 是唯一在 DELETE 中含 issue_id 的版本** |
+
+**API 侧 — `IssueAttachmentDetailAPIEndpoint`**
+
+| 操作 | 查询条件 | 含 issue_id? |
+|------|----------|-------------|
+| POST | N/A（创建时写入） | — |
+| GET 列表 | `issue_id + entity_type + workspace__slug + project_id + is_uploaded` | ✅ 用于过滤 |
+| GET 单个 | `id + workspace__slug + project_id` | ❌ |
+| PATCH | `pk + workspace__slug + project_id` | ❌ |
+| DELETE | `pk + workspace__slug + project_id` | ❌ |
+
+### 7.4 项目内跨工单 asset 访问范围
 
 由于单个资源操作不校验 `issue_id`，**项目级边界是附件访问的最小隔离单元**。具体表现为：
 
@@ -211,28 +451,13 @@ API 层同样仅校验用户是否为项目成员，不校验 issue 级别的权
 |------|----------|------|
 | 同一工单内下载其他附件 | ✅ | 正常行为 |
 | 同项目不同工单间，用 asset_id 下载附件 | ✅ | 查询不含 issue_id，仅校验项目成员 |
-| 跨项目用 asset_id 下载附件 | ❌ | `project_id` 为查询条件，且权限守卫校验项目成员身份 |
-| 跨工作区用 asset_id 下载附件 | ❌ | `workspace__slug` 为查询条件，且权限守卫校验工作区/项目成员身份 |
+| 跨项目用 asset_id 下载附件 | ✅ 可通过 `WorkspaceAssetDownloadEndpoint` 绕过 | 6.3 节详述 |
+| 跨项目用 asset_id 通过 issue URL 下载 | ❌ | `project_id` 为查询条件，且权限守卫校验项目成员身份 |
+| 跨工作区用 asset_id 下载附件 | ❌ | `workspace__slug` 为查询条件，所有端点均校验工作区范围 |
 
-**影响评估**：同项目成员本就有权访问项目内所有工单，因此此行为不构成权限越级。但对于期望工单级别隔离的场景（如外部协作者仅被授予特定工单访问权限），当前实现不满足该需求。
+**影响评估**：同项目成员本就有权访问项目内所有工单，因此通过 issue URL 的跨工单访问不构成权限越级。但 `WorkspaceAssetDownloadEndpoint` 允许工作区成员（无需是项目成员）下载项目内 `ISSUE_ATTACHMENT`，这在设计上可能是一个权限泄漏点。
 
-### 5.4 各端点的权限矩阵
-
-| 端点 | HTTP 方法 | 权限级别 | 允许角色 | 查询条件是否含 issue_id | 特殊规则 |
-|------|-----------|----------|----------|------------------------|----------|
-| `IssueAttachmentV2Endpoint.post` | POST | PROJECT | ADMIN, MEMBER, GUEST | N/A（创建时写入 issue_id） | — |
-| `IssueAttachmentV2Endpoint.get`（列表） | GET | PROJECT | ADMIN, MEMBER, GUEST | ✅ 含（用于过滤结果） | — |
-| `IssueAttachmentV2Endpoint.get`（单个下载） | GET | PROJECT | ADMIN, MEMBER, GUEST | ❌ 不含 | 返回预签名下载 URL（302 重定向） |
-| `IssueAttachmentV2Endpoint.patch`（确认上传） | PATCH | PROJECT | ADMIN, MEMBER, GUEST | ❌ 不含 | — |
-| `IssueAttachmentV2Endpoint.delete` | DELETE | PROJECT | ADMIN | ❌ 不含 | `creator=True`，仅 ADMIN 或创建者可删除 |
-| `WorkspaceFileAssetEndpoint.get` | GET | WORKSPACE | ADMIN, MEMBER, GUEST | N/A | 不含 project_id |
-| `WorkspaceAssetDownloadEndpoint.get` | GET | WORKSPACE | ADMIN, MEMBER, GUEST | N/A | `is_uploaded=True` 校验 |
-| `ProjectAssetDownloadEndpoint.get` | GET | PROJECT | ADMIN, MEMBER, GUEST | N/A | `is_uploaded=True` + project_id 匹配 |
-| `StaticFileAssetEndpoint.get` | GET | **AllowAny** | 无需认证 | N/A | 仅限 LOGO/AVATAR/COVER 类型 |
-| `AssetRestoreEndpoint.post` | POST | WORKSPACE | ADMIN, MEMBER, GUEST | N/A | — |
-| `DuplicateAssetEndpoint.post` | POST | WORKSPACE | ADMIN, MEMBER, GUEST | N/A | 源资产查找限制为用户所属工作区 |
-
-### 5.5 下载流程
+### 7.5 下载流程
 
 当用户点击附件下载时：
 
@@ -244,9 +469,9 @@ API 层同样仅校验用户是否为项目成员，不校验 issue 级别的权
 
 ---
 
-## 6. URL 失效策略
+## 8. URL 失效策略
 
-### 6.1 签名 URL 过期
+### 8.1 签名 URL 过期
 
 所有签名 URL 的有效期由 `SIGNED_URL_EXPIRATION` 环境变量控制，默认 **3600 秒（1 小时）**。过期后 URL 不再可访问，用户需要重新通过 API 端点获取新的签名 URL。
 
@@ -254,29 +479,29 @@ API 层同样仅校验用户是否为项目成员，不校验 issue 级别的权
 - **上传预签名 POST URL**（`generate_presigned_post`）
 - **下载预签名 GET URL**（`generate_presigned_url`）
 
-### 6.2 软删除与恢复
+### 8.2 软删除与恢复
 
-- **删除**：附件删除为软删除操作（`is_deleted=True, deleted_at=now()`），不立即移除对象存储中的文件。V1 端点（`IssueAttachmentEndpoint.delete`）会物理删除存储对象（`asset.delete(save=False)`）并删除数据库记录，V2 端点（`IssueAttachmentV2Endpoint.delete`）仅标记软删除。
+- **删除**：附件删除为软删除操作（`is_deleted=True, deleted_at=now()`），不立即移除对象存储中的文件。V1 端点（`IssueAttachmentEndpoint.delete`）会物理删除存储对象（`asset.delete(save=False)`）并删除数据库记录，V2 端点（`IssueAttachmentV2Endpoint.delete`）和 API 侧端点仅标记软删除。
 - **恢复**：`apps/api/plane/app/views/asset/v2.py` 中的 `AssetRestoreEndpoint` 可将软删除的资产恢复（`is_deleted=False, deleted_at=None`），需要 WORKSPACE 级别权限。
 - **硬删除**：由 `HARD_DELETE_AFTER_DAYS`（默认 60 天）环境变量控制，通过定时任务清理软删除超过指定天数的资产。
 
-### 6.3 前端 asset_url 机制
+### 8.3 前端 asset_url 机制
 
 `asset_url` 是一个相对 API 路径（如 `/api/assets/v2/workspaces/.../attachments/{id}/`），本身永不过期。每次前端访问此路径时，后端都会生成新的签名 URL 进行重定向。因此，**前端的下载链接始终有效**（只要用户有权限且资产未被删除），签名 URL 的过期不影响业务层面的可用性。
 
 ---
 
-## 7. 跨工作区与跨项目引用边界
+## 9. 跨工作区与跨项目引用边界
 
-### 7.1 资产的工作区隔离
+### 9.1 资产的工作区隔离
 
 `FileAsset` 的存储键格式为 `{workspace_id}/{uuid}-{name}`，从存储层面实现了工作区隔离。所有查询均通过 `workspace__slug=slug` 条件限定工作区范围。
 
-### 7.2 项目级隔离（非工单级）
+### 9.2 项目级隔离（非工单级）
 
-如第 5.3 节所述，附件访问的最小隔离单元是**项目**而非工单。URL 中虽然包含 `issue_id`，但单个资源操作（下载、确认上传、删除）的数据库查询均不使用 `issue_id` 作为过滤条件。权限隔离依赖 `workspace__slug + project_id` 双重约束和 `@allow_permission` 的项目成员校验。
+如第 7.4 节所述，附件访问的最小隔离单元是**项目**而非工单。URL 中虽然包含 `issue_id`，但单个资源操作（下载、确认上传、删除）的数据库查询均不使用 `issue_id` 作为过滤条件（V1 DELETE 除外）。权限隔离依赖 `workspace__slug + project_id` 双重约束和 `@allow_permission` 的项目成员校验。
 
-### 7.3 DuplicateAssetEndpoint 的跨工作区边界
+### 9.3 DuplicateAssetEndpoint 的跨工作区边界
 
 `apps/api/plane/app/views/asset/v2.py` 中的 `DuplicateAssetEndpoint` 用于跨实体复制资产（如 issue 复制时连带复制附件），其安全边界如下：
 
@@ -295,9 +520,9 @@ API 层同样仅校验用户是否为项目成员，不校验 issue 级别的权
 
 ---
 
-## 8. 前端预览组件的权限继承
+## 10. 前端预览组件的权限继承
 
-### 8.1 附件列表与预览
+### 10.1 附件列表与预览
 
 前端附件展示组件分为两种视图：
 
@@ -306,7 +531,7 @@ API 层同样仅校验用户是否为项目成员，不校验 issue 级别的权
 
 两者都通过 `getFileURL(attachment.asset_url)` 构造下载 URL，本质上是向后端 API 端点发起 GET 请求。
 
-### 8.2 权限继承逻辑
+### 10.2 权限继承逻辑
 
 前端附件组件本身 **不进行独立的权限判断**，权限完全继承自其父级上下文：
 
@@ -314,7 +539,7 @@ API 层同样仅校验用户是否为项目成员，不校验 issue 级别的权
 2. **组件级禁用**：通过 `disabled` prop 控制是否允许上传/删除操作，该 prop 由上层组件根据用户角色（如 GUEST 角色可能禁用上传）传入。
 3. **下载权限**：点击下载时，浏览器直接请求后端 API（携带认证 Cookie），后端通过 `allow_permission` 再次校验权限。若权限不足，返回 403 而非签名 URL。
 
-### 8.3 Space（公开门户）的附件访问
+### 10.3 Space（公开门户）的附件访问
 
 `apps/api/plane/space/views/asset.py` 中的 `EntityAssetEndpoint` 用于 Plane Space 公开工单板：
 
@@ -323,7 +548,7 @@ API 层同样仅校验用户是否为项目成员，不校验 issue 级别的权
 
 **注意**：Space 的 GET 端点通过 `entity_type` 白名单排除了 `ISSUE_ATTACHMENT` 类型，意味着工单的显式附件**不会**在公开门户中暴露，仅描述和评论中的内嵌图片可被匿名用户访问。
 
-### 8.4 StaticFileAssetEndpoint 的特殊处理
+### 10.4 StaticFileAssetEndpoint 的特殊处理
 
 `apps/api/plane/app/views/asset/v2.py` 中的 `StaticFileAssetEndpoint` 使用 `AllowAny` 权限，仅允许访问以下类型：
 
@@ -336,7 +561,7 @@ API 层同样仅校验用户是否为项目成员，不校验 issue 级别的权
 
 ---
 
-## 9. 前端文件名校验行为详析
+## 11. 前端文件名校验行为详析
 
 `packages/services/src/file/helper.ts` 中的文件名校验流程：
 
@@ -373,7 +598,7 @@ validateFilename(filename)  →  返回 string | null
 
 ---
 
-## 10. 安全措施总结
+## 12. 安全措施总结
 
 | 安全维度 | 实现机制 |
 |----------|----------|
@@ -385,9 +610,10 @@ validateFilename(filename)  →  返回 string | null
 | **签名下载** | 所有下载通过后端重定向至临时签名 URL，签名默认 1 小时过期 |
 | **权限分层** | PROJECT 级（工单附件）和 WORKSPACE 级（工作区资产）两级权限控制 |
 | **权限粒度** | 附件访问隔离粒度为**项目级**，非工单级。同项目内用户可通过 asset_id 访问任意工单的附件 |
-| **角色控制** | ADMIN/MEMBER/GUEST 三级角色，删除操作仅 ADMIN 或创建者 |
+| **Download 端点绕过** | `WorkspaceAssetDownloadEndpoint` 和 `ProjectAssetDownloadEndpoint` 不按 `entity_type` 过滤，工作区/项目成员可绕过 issue URL 下载 `ISSUE_ATTACHMENT` 资产 |
+| **角色控制** | ADMIN/MEMBER/GUEST 三级角色，App V2 删除操作仅 ADMIN 或创建者；API 侧删除允许所有角色 + issue 创建者 |
 | **工作区隔离** | 存储键包含 workspace_id，查询均限定工作区范围 |
 | **软删除** | 附件删除为软删除，可恢复，硬删除由定时任务在 60 天后执行 |
 | **限流** | `AssetRateThrottle` 针对资产操作进行频率限制 |
-| **公共资产白名单** | `StaticFileAssetEndpoint` 仅对头像/Logo/封面等公共类型允许匿名访问 |
+| **公共资产白名单** | `StaticFileAssetEndpoint` 仅对头像/Logo/封面等公共类型允许匿名访问（有 `entity_type` 过滤） |
 | **Space 门户隔离** | 公开门户仅暴露 `ISSUE_DESCRIPTION` 和 `COMMENT_DESCRIPTION`，不暴露 `ISSUE_ATTACHMENT` |
