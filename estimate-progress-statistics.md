@@ -59,13 +59,15 @@ areEstimateEnabledByProjectId = computedFn((projectId: string) => {
 - **Categories**: T-Shirt(XS,S,M,L,XL,XXL)、Easy-to-hard(Easy,Medium,Hard,Very Hard)、Custom
 - **Time**: Hours(1-6)，**is_ee: true**
 
-### 1.4 TIME 分制的实际存储单位与展示方式
+### 1.4 TIME 分制的存储单位与展示方式
 
-这是容易混淆的部分，需逐层说明：
+需区分 **产品语义推断** 和 **代码行为事实** 两层来讨论：
 
-**模板定义层**：TIME 的 hours 模板 value 值为 `"1"`, `"2"`, `"3"`, `"4"`, `"5"`, `"6"`（`packages/constants/src/estimates.ts#L126-L137`），这些数字代表的是 **小时数**，不是分钟数。
+#### 代码行为事实
 
-**模板预览层**：`EstimateCreateStageOne` 组件展示模板时，对 TIME 类型调用 `convertMinutesToHoursMinutesString(Number(template.value))`（`apps/web/core/components/estimates/create/stage-one.tsx#L110-L112`）：
+1. **模板定义**：TIME 的 hours 模板 value 值为 `"1"`, `"2"`, `"3"`, `"4"`, `"5"`, `"6"`（`packages/constants/src/estimates.ts#L126-L137`）。
+
+2. **模板预览**：`EstimateCreateStageOne` 组件展示模板时，对 TIME 类型调用 `convertMinutesToHoursMinutesString(Number(template.value))`（`apps/web/core/components/estimates/create/stage-one.tsx#L110-L112`）：
 
 ```ts
 estimateSystem === (EEstimateSystem.TIME as TEstimateSystemKeys)
@@ -73,21 +75,35 @@ estimateSystem === (EEstimateSystem.TIME as TEstimateSystemKeys)
   : template.value
 ```
 
-`convertMinutesToHoursMinutesString` 的输入参数名为 `totalMinutes`（`packages/utils/src/datetime.ts#L367-L371`），内部用 `Math.floor(mins / 60)` 计算小时。但 hours 模板传入的 value 是 `"1"`, `"2"` 等小数字符串，`Number("1")` = 1，被当作 1 **分钟** 处理：
+`convertMinutesToHoursMinutesString` 的输入参数名为 `totalMinutes`（`packages/utils/src/datetime.ts#L367-L371`），内部用 `Math.floor(mins / 60)` 计算小时。hours 模板传入的 value 是 `"1"`, `"2"` 等小数字符串，`Number("1")` = 1，被当作 1 **分钟** 处理：
 
 - value `"1"` → `convertMinutesToHoursMinutesString(1)` → `"1m "`（1 分钟，0 小时）
 - value `"2"` → `convertMinutesToHoursMinutesString(2)` → `"2m "`（2 分钟）
 - value `"6"` → `convertMinutesToHoursMinutesString(6)` → `"6m "`（6 分钟）
 
-**所以模板预览显示的是 "1m, 2m, 3m, 4m, 5m, 6m"，而非 "1h, 2h, 3h, 4h, 5h, 6h"**。这表明 TIME 分制的 `value` 字段在当前模板中的语义实际上是 **分钟**，而非小时——尽管模板名叫 "Hours"。换言之，如果用户想表示 2 小时，需要在 EstimatePoint 的 value 中存入 `"120"`。
+**事实**：模板预览显示 "1m, 2m, 3m, 4m, 5m, 6m"，而非 "1h, 2h, 3h, 4h, 5h, 6h"。
 
-**自定义录入层**：TIME 类型使用 `EstimateTimeInput` 组件（`apps/web/ce/components/estimates/inputs/time-input.tsx`），但在 CE 版中该组件是空壳 `<></>`，EE 版的实现不在本仓库中。创建/编辑时，TIME 和 POINTS 共用同一套数值校验逻辑（`apps/web/core/components/estimates/points/create.tsx#L97-L106`）：必须为正数，`Number(value) > 0`。
+3. **自定义录入**：TIME 类型使用 `EstimateTimeInput` 组件（`apps/web/ce/components/estimates/inputs/time-input.tsx`），CE 版为空壳 `<></>`，EE 版实现不在本仓库。创建/编辑时，TIME 和 POINTS 共用同一套数值校验逻辑（`apps/web/core/components/estimates/points/create.tsx#L97-L106`）：必须为正数，`Number(value) > 0`。
 
-**展示层**：所有展示 TIME 类型 estimate 值的地方（dropdown、readonly、preview）统一调用 `convertMinutesToHoursMinutesString(Number(estimatePoint.value))`，将 value 当作分钟数格式化为 `"Xh Ym"` 格式。
+4. **展示层**：所有展示 TIME 类型 estimate 值的地方（dropdown、readonly、preview）统一调用 `convertMinutesToHoursMinutesString(Number(estimatePoint.value))`，将 value 当作分钟数格式化为 `"Xh Ym"` 格式。
 
-**后端汇总层**：后端统计只认 `estimate_point__estimate__type="points"`，TIME 类型的 EstimatePoint 完全不参与汇总（详见第三节）。
+5. **后端汇总层**：后端统计只认 `estimate_point__estimate__type="points"`，TIME 类型的 EstimatePoint 完全不参与汇总（详见第三节）。
 
-**总结**：TIME 分制的 value 存储单位在代码约定上是 **分钟**，`convertMinutesToHoursMinutesString` 函数的参数名也明确为 `totalMinutes`。但默认 hours 模板的值 "1"-"6" 被当作 1-6 分钟处理，实际展示效果为 "1m"-"6m"，与 "Hours" 模板名称的语义有偏差。如果用户想表示 N 小时，应存入 N×60 的值。
+#### 产品语义推断
+
+模板名为 "Hours"，且 `is_ee: true` 标识这是企业版功能。从产品意图看，TIME 分制的设计目的是按小时估算工作量。`convertMinutesToHoursMinutesString` 函数的参数名 `totalMinutes` 也表明代码约定 value 存储单位为分钟——这意味着产品预期用户输入分钟数，函数负责将其格式化为 "Xh Ym" 的可读形式。
+
+但默认 hours 模板的 value "1"-"6" 被格式化函数当作 1-6 分钟，展示为 "1m"-"6m"，与 "Hours" 模板名称的预期不符。如果产品意图是表示 1-6 小时，模板值应为 "60"-"360"（分钟）。当前模板值与产品语义之间存在偏差——**这既可能是模板值设计缺陷（应为 60/120/180/240/300/360 而非 1-6），也可能是格式化函数选型错误（应对 TIME 类型直接显示数字+小时后缀而非走分钟转换）**，仅从代码无法确定。
+
+#### 总结
+
+| 层面 | 确定事实 | 不确定推断 |
+|------|----------|-----------|
+| value 存储内容 | `"1"`, `"2"`, `"3"`, `"4"`, `"5"`, `"6"` | — |
+| 格式化函数参数语义 | `totalMinutes`，按分钟处理 | — |
+| 模板预览实际展示 | "1m"-"6m" | — |
+| 产品预期展示 | — | 可能是 "1h"-"6h" |
+| value 应存什么 | — | 若表示 N 小时应存 N×60（分钟），或格式化函数应区分处理 |
 
 ---
 
