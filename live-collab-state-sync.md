@@ -185,34 +185,37 @@ updateIssue = async (workspaceSlug, projectId, issueId, data) => {
 };
 ```
 
-**分支 A** — `BaseIssuesStore.issueUpdate`（[base-issues.store.ts#L554-L588](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L554-L588)）内部是**串行**的：
+**JavaScript 微任务层面的精确调用发起顺序**：`Promise.all` 接收两个 Promise，它们的执行函数在**同一个微任务**中依次启动：
 
 ```
-A-① clone(getIssueById) 保存快照                               ← 同步
-A-② rootIssueStore.issues.updateIssue(issueId, data)           ← 乐观写入 issuesMap（同步）
-A-③ updateIssueList(...)                                       ← 更新列表分组 ID（同步）
-A-④ updateParentStats(...)                                     ← 乐观更新父级统计（同步）
-A-⑤ await this.issueService.patchIssue(...)                   ← REST PATCH（异步，等 204）
-A-⑥ fetchParentStats(...)                                     ← PATCH 成功后才执行（不 await，fire-and-forget）
-A-⑦ [如果 ⑤ 失败] rootIssueStore.issues.updateIssue(issueBeforeUpdate) ← 回滚
+① 分支 A 同步执行至第一个 await：
+   A-1 clone(getIssueById) 保存快照                              ← 同步
+   A-2 rootIssueStore.issues.updateIssue(issueId, data)          ← 乐观写入 issuesMap（同步，UI 立即重渲染）
+   A-3 updateIssueList(...)                                      ← 更新列表分组 ID（同步）
+   A-4 updateParentStats(...)                                    ← 乐观更新 projectMap 统计（同步）
+   A-5 await this.issueService.patchIssue(...)                   ← 遇到 await，挂起分支 A
+
+② 分支 B 同步执行至第一个 await：
+   B-1 检查已有活动记录，取最后一条的 created_at                  ← 同步
+   B-2 await this.issueActivityService.getIssueActivities(...)   ← 遇到 await，挂起分支 B
+
+③ 此时分支 A 的 PATCH 请求和分支 B 的 GET/activities 请求
+   已在浏览器网络栈中排队，**几乎同时发出**（无先后保证）
 ```
 
-**分支 B** — `IssueActivityStore.fetchActivities`（[activity.store.ts#L142-L178](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/ce/store/issue/issue-details/activity.store.ts#L142-L178)）**立即发起 GET 请求**：
+**分支 A 剩余部分**（PATCH 返回 204 后恢复执行）：
 
 ```
-B-① 检查已有活动记录，取最后一条的 created_at
-B-② GET /api/.../activities/?created_at__gt=lastActivity.created_at  ← 增量拉取
-B-③ 将新活动记录写入 activityMap + activities
+A-6 fetchParentStats(...)                                       ← PATCH 成功后才执行，不 await（fire-and-forget）
+A-7 [如果 A-5 失败] rootIssueStore.issues.updateIssue(issueBeforeUpdate) ← 回滚
 ```
-
-**关键：分支 A 和分支 B 是并行的。** 分支 B 的 `fetchActivities` 在分支 A 的 PATCH 还没发出时就可能已经发起 GET 请求了——因为 `Promise.all` 不等分支 A 完成。
 
 **关键观察**：
-- 步骤 A-② 立即修改 `issuesMap` → observer 组件即时重渲染 → UI 无延迟
-- 步骤 A-⑤ PATCH 成功后 **不会** 重新 fetch 该 issue 来拿服务端计算的字段（如 `updated_at`、`completed_at`），本地保留的是乐观值
-- 步骤 A-⑤ PATCH 成功后也不会调 `addIssue()` 做服务端数据的浅合并回写
-- 步骤 A-⑥ `fetchParentStats` 只刷新**父级统计**（每个 state/priority 的 issue 数量），不修正当前 issue 的任何字段
-- 步骤 B 的 `fetchActivities` 可能**早于 Celery `issue_activity.delay()` 落库**就发起 GET → 拉不到刚产生的活动记录（详见第四章时序分析）
+- 步骤 A-2 立即修改 `issuesMap` → observer 组件即时重渲染 → UI 无延迟
+- 步骤 A-5 PATCH 成功后 **不会** 重新 fetch 该 issue 来拿服务端计算的字段（如 `updated_at`、`completed_at`），本地保留的是乐观值
+- 步骤 A-5 PATCH 成功后也不会调 `addIssue()` 做服务端数据的浅合并回写
+- 步骤 A-6 `fetchParentStats` 调用 [project.fetchProjectDetails](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/project/project.store.ts#L364-L375)，发出 `GET /api/.../projects/:id/`，返回值写入 **`projectMap`**（非 `issuesMap`），只修正项目的 `total_issues`/`cancelled_issues`/`completed_issues` 等统计字段
+- 步骤 B-2 的 `fetchActivities` 与 PATCH **几乎同时发出**——详见第四章时序分析
 
 #### 3.3.2 其他用户（User B）看到变更的路径
 
@@ -483,52 +486,163 @@ if origin:
 
 #### 4.5.1 编辑者（User A）的完整时序
 
-由于 `IssueDetail.updateIssue` 使用 `Promise.all` 并行发起分支 A（issueUpdate）和分支 B（fetchActivities），两者的时序交织如下：
+##### 客户端发起阶段
+
+`Promise.all` 在同一个微任务中依次启动分支 A 和分支 B，两个 HTTP 请求几乎同时进入浏览器网络栈：
 
 ```
-t0: A-② 乐观更新 issuesMap[id].state_id = "closed"         → UI 立即更新
-t1: A-⑤ PATCH /api/.../issues/:id/ 请求发出
-    B-② GET /api/.../activities/ 请求发出（并行，不等 PATCH）
-t2: PATCH 到达服务端 → serializer.save() → DB 写入 "closed"
-    ├── [Celery] issue_activity.delay(...) 投入队列          ← 异步，不阻塞响应
-    ├── [Celery] model_activity.delay(...) 投入队列          ← 异步，不阻塞响应
-    └── [Celery] issue_description_version_task.delay(...) 投入队列 ← 异步
-t3: 服务端返回 204 No Content → A-⑤ await 结束
-t4: B-② GET /activities/ 返回                               ← 可能在 Celery 任务执行前或后
-    ├── [如果 Celery 已执行] 拉到新 IssueActivity 记录      ← 活动流更新
-    └── [如果 Celery 未执行] 拉不到新记录                    ← 活动流不更新
-t5: A-⑥ fetchParentStats() 发出 GET /analytics/             ← fire-and-forget，不 await
-    → 只修正父级统计，不修正 issuesMap 中的 issue 字段
-t6: [Celery] issue_activity 执行：
-    a. Redis SET issue_id→origin (TTL=600s)
-    b. issue.updated_at = now(); issue.save()
-    c. 字段 diff → bulk_create IssueActivity
-    d. notifications.delay(...) → Notification + EmailNotificationLog
-t7: [Celery] model_activity → webhook_activity → webhook_send_task → 外部 HTTP POST
+[微任务内]
+  A-1 ~ A-4 同步执行：乐观更新 issuesMap + projectMap + 列表分组
+  A-5 await patchIssue(...)     → PATCH HTTP 请求排队
+  B-1 同步执行：检查 activityMap 增量锚点
+  B-2 await getIssueActivities(...) → GET /activities/ HTTP 请求排队
+  [微任务结束，浏览器发出两个 HTTP 请求]
 ```
 
-**各拉取操作能修正什么数据**：
+##### 服务端处理 PATCH 请求
 
-| 拉取操作 | 触发时机 | 能修正的数据 | 不能修正的数据 |
-|----------|----------|-------------|---------------|
-| `fetchActivities`（分支 B） | `Promise.all` 并行发出 | 活动流记录（`activityMap`） | ❌ issuesMap 中的 issue 字段（活动记录不含完整 issue） |
-| `fetchParentStats`（A-⑥） | PATCH 成功后 fire-and-forget | 父级统计（state/priority 的 issue 计数） | ❌ issuesMap 中的 issue 字段 |
-| SWR revalidation → `fetchIssueWithIdentifier` | 标签页焦点 / 网络恢复 | **issuesMap 中的全部字段**（含 `updated_at` 等服务端计算字段） | — |
-
-**核心问题**：
-1. **PATCH 返回 204 无 body**——编辑者无法用响应体修正 `issuesMap`，本地保留乐观值
-2. **`fetchActivities` 可能早于 Celery 落库**——因为分支 B 和 PATCH 并行发出，而 Celery 任务是异步的。GET 到达服务端时，`IssueActivity` 记录可能还没写入 DB
-3. **`fetchActivities` 是增量拉取**——使用 `created_at__gt=lastActivity.created_at` 过滤，只能拉到**已落库**的新记录。如果 Celery 还没落库，增量拉取会返回空列表，且**不会重试**
-4. **没有任何拉取操作在 PATCH 成功后主动修正 `issuesMap`**——`fetchParentStats` 只管统计，`fetchActivities` 只管活动流，`issuesMap` 中的 `updated_at` 等服务端计算字段永远停留在乐观值
-
-#### 4.5.2 其他用户（User B）的感知时序
+[IssueViewSet.partial_update](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/api/plane/app/views/issue/base.py#L616-L701) 在**一个同步请求周期**内完成以下操作：
 
 ```
-t2: User A PATCH → 服务端 DB 写入 "closed"
-t6: [Celery] IssueActivity + Notification 写入 DB
-t?: User B 切换标签页回来 → SWR revalidateOnFocus
+[PATCH 请求到达服务端]
+  S-1 queryset.annotate(label_ids, assignee_ids, module_ids).filter(pk=pk).first()
+      ← 同步 DB 查询，获取更新前的 issue 实例
+  S-2 current_instance = json.dumps(IssueDetailSerializer(issue).data)
+      ← 同步，序列化更新前快照（用于后续 Celery diff）
+  S-3 requested_data = json.dumps(request.data)
+      ← 同步，序列化请求体
+  S-4 serializer = IssueCreateSerializer(issue, data=request.data, partial=True)
+  S-5 serializer.save()
+      ← 同步 DB 写入，事务提交（Django 默认 autocommit）
+      ← 此时 issue 已持久化到 DB
+  S-6 issue_activity.delay(
+        type="issue.activity.updated",
+        requested_data=requested_data,
+        current_instance=current_instance, ...)
+      ← 同步，但仅入队（Celery delay = apply_async = broker LPUSH/PUBLISH）
+      ← 不等 worker 执行，耗时 ~1-5ms（Redis 写入）
+  S-7 model_activity.delay(model_name="issue", ...)
+      ← 同步，仅入队
+  S-8 issue_description_version_task.delay(updated_issue=current_instance, ...)
+      ← 同步，仅入队
+  S-9 return Response(status=status.HTTP_204_NO_CONTENT)
+      ← 返回 204，此时 DB 已写入但 Celery 任务尚未执行
+```
+
+**关键区分**：`serializer.save()`（S-5）是**同步 DB 写入**，在 204 返回前已提交。`issue_activity.delay()`（S-6）是**同步入队**，只将任务消息推入 Redis broker，worker 尚未开始执行。204 响应发出时，DB 中只有更新后的 issue 行，**没有任何 IssueActivity、Notification 记录**。
+
+##### 客户端收到 204 后
+
+```
+[浏览器收到 204]
+  A-5 await 结束 → 分支 A 恢复执行
+  A-6 fetchParentStats() → GET /api/.../projects/:id/  ← fire-and-forget
+      写入目标：projectMap（非 issuesMap）
+
+[浏览器收到 GET /activities/ 响应]
+  B-2 await 结束 → 分支 B 恢复执行
+  B-3 runInAction → 将活动记录写入 activityMap + activities
+```
+
+##### Celery worker 执行（独立进程，时序不确定）
+
+```
+[Worker 从 broker 取出任务]
+  C-1 issue_activity 任务执行：
+      a. Redis SET issue_id→origin (TTL=600s)
+      b. issue.updated_at = timezone.now(); issue.save(update_fields=["updated_at"])
+         ← 再次写入 DB，更新 updated_at
+      c. update_issue_activity: 逐字段 diff → bulk_create IssueActivity
+         ← 此时 IssueActivity 记录才落库
+      d. notifications.delay(...) → 入队
+  C-2 model_activity 任务执行：
+      → webhook_activity.delay(...) → 入队
+  C-3 notifications 任务执行：
+      → bulk_create Notification + EmailNotificationLog
+         ← 此时通知记录才落库
+  C-4 webhook_activity → webhook_send_task → HTTP POST 外部端点
+  C-5 issue_description_version_task 执行：
+      → 创建/更新 IssueDescriptionVersion
+```
+
+##### 竞态来源分类
+
+| 竞态 | 来源 | 是否确定性 | 说明 |
+|------|------|-----------|------|
+| PATCH vs GET/activities 的网络到达顺序 | **网络延迟** | 不确定 | 两个请求几乎同时发出，到达服务端的顺序取决于 TCP 连接复用、网络抖动等 |
+| GET/activities 到达时 IssueActivity 是否已落库 | **Celery worker 执行延迟** | 不确定 | S-6 入队到 C-1c 落库之间有：broker 传输 + worker 取出 + diff 计算 + bulk_create。通常 50-200ms，繁忙时可达秒级 |
+| `fetchParentStats` 到达时 project 统计是否已反映 PATCH | **无竞态** | 确定 | S-5 已同步写入 DB，project 统计查询基于 DB 聚合，一定能读到最新值 |
+| SWR revalidation 到达时 PATCH 是否已落库 | **网络延迟** | 不确定 | 取决于用户切换标签页的时机 vs PATCH 往返时间 |
+
+**结论**：
+- **网络级竞态**（PATCH vs GET/activities 的到达顺序）在实际中几乎不影响结果——因为即使 PATCH 先到达并完成 S-5 写入，GET/activities 查询的也是 `IssueActivity` 表而非 `Issue` 表，而 `IssueActivity` 的落库取决于 Celery worker
+- **真正的竞态是 Celery worker 执行延迟**：无论 GET/activities 在 PATCH 之前还是之后到达，都**极可能早于** C-1c（IssueActivity 落库），因为 C-1c 需要经过 broker 传输 + worker 取出 + diff + bulk_create
+- `fetchParentStats` 不存在竞态——S-5 已同步写入 DB，后续的 project 查询一定能读到最新 issue 数据
+
+#### 4.5.2 各拉取操作能更新的数据范围
+
+| 拉取操作 | 触发时机 | HTTP 请求 | 写入 store | 写入 issuesMap？ | 能修正的数据 |
+|----------|----------|-----------|-----------|-----------------|-------------|
+| `fetchActivities`（分支 B） | `Promise.all` 与 PATCH 并行 | `GET /activities/?created_at__gt=...` | `activityMap` + `activities` | ❌ | 活动流记录（field/old_value/new_value/actor），不含 issue 字段 |
+| `fetchParentStats`（A-6） | PATCH 204 后 fire-and-forget | `GET /projects/:id/` | `projectMap` | ❌ | 项目统计（total_issues/completed_issues/cancelled_issues 等），不含任何 issue 字段 |
+| SWR revalidation | 标签页焦点 / 网络恢复 | `GET /issues/:id/` | `issuesMap`（via `addIssue`） | ✅ 浅合并覆盖 | **issuesMap 中的全部字段**（含 `updated_at`、`completed_at` 等服务端计算字段），但也会覆盖本地未提交修改 |
+| `fetchComments` | 手动/组件挂载 | `GET /issues/:id/comments/` | `commentMap` | ❌ | 评论列表 |
+| `fetchReactions` | 手动/组件挂载 | `GET /issues/:id/reactions/` | `reactionMap` | ❌ | 表情回应 |
+| `fetchLinks` | 手动/组件挂载 | `GET /issues/:id/links/` | `linkMap` | ❌ | 链接列表 |
+| `fetchAttachments` | 手动/组件挂载 | `GET /issues/:id/attachments/` | `attachmentMap` | ❌ | 附件列表 |
+| `fetchSubIssues` | 手动/组件挂载 | `GET /issues/:id/sub-issues/` | `subIssueMap` | ❌ | 子 issue 列表 |
+| `fetchRelations` | 手动/组件挂载 | `GET /issues/:id/relations/` | `relationMap` | ❌ | 关联 issue 列表 |
+
+**核心结论**：
+- 编辑者的 `issuesMap` 在 PATCH 成功后**没有任何拉取操作主动修正**——`fetchActivities` 只修活动流，`fetchParentStats` 只修 `projectMap`，`issuesMap` 中的 `updated_at` 等服务端计算字段永远停留在乐观值
+- 其他客户端的 `issuesMap` **只能通过 `fetchIssueWithIdentifier`（SWR revalidation）修正**
+- 所有子资源拉取（comments/reactions/links/attachments/subIssues/relations）都不触及 `issuesMap`
+
+#### 4.5.3 `fetchActivities` 与 Celery 落库的竞态
+
+`fetchActivities`（分支 B）的 GET/activities 请求与 Celery `issue_activity` 任务的执行存在**确定性竞态**：
+
+```
+客户端时间线                        服务端时间线
+──────────                        ──────────
+A-5 PATCH 请求发出
+B-2 GET /activities/ 请求发出
+  │                                PATCH 到达 → S-1~S-5 同步执行（~20ms）
+  │                                S-5 serializer.save() → DB 写入 "closed"  ← 已提交
+  │                                S-6 issue_activity.delay(...) → Redis 入队   ← ~1-5ms
+  │                                S-7 model_activity.delay(...) → Redis 入队
+  │                                S-8 issue_description_version_task.delay(...)
+  │                                S-9 返回 204 ─────────────────────────────→ A-5 await 结束
+  │
+  │                                GET /activities/ 到达 → DB 查询
+  │                                此时 IssueActivity 表中无新记录          ← C-1c 尚未执行
+  │                                返回空列表 ─────────────────────────────→ B-2 await 结束
+  │
+  │                                [Celery worker 从 broker 取出任务]
+  │                                C-1a Redis SET
+  │                                C-1b issue.updated_at = now(); save()
+  │                                C-1c diff → bulk_create IssueActivity    ← 此时才落库
+  │                                C-1d notifications.delay(...)
+```
+
+**竞态分析**：
+- GET/activities 查询的是 `IssueActivity` 表，不是 `Issue` 表
+- `IssueActivity` 记录在 C-1c 才落库，这需要经过：broker 传输（~1ms）+ worker 取出（取决于队列深度，0ms~数秒）+ diff 计算（~5ms）+ bulk_create（~5ms）
+- 204 响应返回后（S-9），GET/activities 的到达和 C-1c 的执行**完全独立**
+- **通常情况下 GET/activities 会早于 C-1c**——因为 GET 只需 ~50ms 往返，而 Celery 通常需要 ~100-300ms 完成 C-1a~C-1c
+- 但如果 Celery worker 空闲且恰好在同一进程，也可能 C-1c 先完成
+
+**增量拉取的盲区**：`fetchActivities` 使用 `created_at__gt=lastActivity.created_at` 增量过滤。如果本次 GET 没拉到新记录（Celery 还没落库），后续的 `fetchActivities` 调用仍会用同一个锚点——**但只有在 `Promise.all` 的 `updateIssue` 中才会再次触发**。用户手动操作（如切换 state）会触发新的 `Promise.all`，其中包含新的 `fetchActivities`，此时 C-1c 可能已经完成，增量拉取可以补回漏掉的记录。
+
+#### 4.5.4 其他用户（User B）的感知时序
+
+```
+t1: [User A] PATCH 到达服务端 → S-5 DB 写入 "closed" → S-9 返回 204
+t2: [Celery] C-1c IssueActivity 落库
+t3: [Celery] C-3 Notification 落库
+t?: [User B] 切换标签页回来 → SWR revalidateOnFocus
     → fetchIssueWithIdentifier() → GET /api/.../issues/:id/
-    → 服务端返回最新数据（state_id="closed", updated_at=新时间戳）
+    → 服务端返回最新数据（state_id="closed", updated_at=C-1b的时间戳）
     → addIssue() → { ...prevIssue, ...serverIssue } 浅合并覆盖
     → UI 更新：state_id 从 "open" 跳变为 "closed"
 ```
@@ -536,65 +650,30 @@ t?: User B 切换标签页回来 → SWR revalidateOnFocus
 **关键问题**：
 - User B 感知 User A 的修改**完全依赖** SWR revalidation 或手动刷新，没有推送通道
 - 如果 User B 也正在修改同一 issue，`addIssue` 的浅合并会用服务端全量数据覆盖 User B 的本地未提交修改
-- User B 的通知铃铛可能在 SWR revalidation 之前就显示"state 变更"通知（因为 `Notification` 记录在 Celery 任务中已经创建），但 Issue 详情页仍显示旧值——**通知和详情不一致**
-- User B 的活动流也是空的——除非 User B 也触发了 `fetchActivities`（但 User B 的 `fetchActivities` 不在 `updateIssue` 的 `Promise.all` 中被触发，只有编辑者的才会）
+- User B 的通知铃铛可能在 SWR revalidation 之前就显示"state 变更"通知（C-3 落库后），但 Issue 详情页仍显示旧值——**通知和详情不一致**
+- User B 的活动流不会自动更新——`fetchActivities` 只在编辑者 User A 的 `Promise.all` 中被触发，User B 需要手动刷新
+- User B 通过 SWR revalidation 拿到的 `updated_at` 是 C-1b 写入的值（Celery 任务中的 `timezone.now()`），不是 S-5 写入的值——这解释了为什么 `updated_at` 会有细微延迟
 
-#### 4.5.3 `fetchActivities` 与 Celery 落库的竞态分析
-
-`fetchActivities`（分支 B）与 Celery `issue_activity.delay()` 存在**确定性竞态**：
-
-```
-分支 B 时序：                    服务端 Celery 时序：
-  B-② GET /activities/ 发出
-  │                              PATCH 到达 → serializer.save()
-  │                              ├── 返回 204
-  │                              └── issue_activity.delay(...) 投入队列
-  │
-  │                              [Celery worker 排队等待]
-  B-② GET 到达 DB → 查询        [Celery worker 开始执行]
-  │                              ├── diff → bulk_create IssueActivity
-  │                              └── notifications.delay(...)
-  B-② 返回结果（可能不含新记录） ←── 取决于 GET 和 Celery 哪个先完成
-```
-
-**结论**：在正常情况下（Celery worker 空闲、网络延迟 ~50ms），Celery 任务通常会在 GET 请求到达之前或同时完成，`fetchActivities` **有机会**拉到新记录。但如果 Celery 队列繁忙或 worker 正在处理其他任务，`fetchActivities` **一定**拉不到——且不会重试，编辑者需要手动刷新才能看到自己的活动记录。
-
-**更严重的是**：由于 `fetchActivities` 使用增量拉取（`created_at__gt`），即使后续再次调用 `fetchActivities`，如果中间没有更新的活动记录作为锚点，仍可能拉不到漏掉的记录——除非全量刷新。
-
-#### 4.5.4 PATCH 响应与后续拉取的竞态
+#### 4.5.5 PATCH 响应与 SWR revalidation 的竞态
 
 ```
 时间线（User A）：
-  t0: 乐观更新 state_id = "closed"
-  t1: PATCH 请求发出
+  t0: A-2 乐观更新 issuesMap[id].state_id = "closed"
+  t1: A-5 PATCH 请求发出
   t2: [网络延迟] PATCH 尚未到达服务端
   t3: User A 切换标签页后切回 → SWR revalidateOnFocus
-  t4: GET /api/.../issues/:id/ → 返回旧值 state_id = "open"（PATCH 尚未写入）
+  t4: GET /api/.../issues/:id/ → 返回旧值 state_id = "open"（S-5 尚未执行）
   t5: addIssue() 浅合并 → issuesMap 被覆盖为 "open" → 闪烁！
-  t6: PATCH 到达服务端 → DB 写入 "closed"
+  t6: PATCH 到达服务端 → S-5 DB 写入 "closed"
   t7: 下次 SWR revalidation → GET 返回 "closed" → 再次闪烁！
 ```
 
-**根因**：`issueUpdate()` 不等待 PATCH 响应就触发后续数据拉取。SWR 的 `revalidateOnFocus` 可能在 PATCH 完成前就触发 GET，拉回旧值覆盖乐观更新。
+**根因**：乐观更新写入 `issuesMap` 后，如果 SWR revalidation 在 PATCH 落库前触发 GET，会拉回旧值覆盖乐观更新。
 
 可能的缓解策略（代码中尚未实现）：
 1. PATCH 成功后立即用服务端响应回写 `issuesMap`——但当前返回 204，无 body 可用
 2. PATCH 进行中时暂时禁用 SWR revalidation——需要修改 SWR 配置
 3. 将 `IssueViewSet.partial_update` 改为返回 `200 serializer.data`——让前端能用响应体修正本地状态
-
-#### 4.5.5 各拉取操作对其他客户端 `issuesMap` 的影响
-
-对于其他客户端（User B），只有 `fetchIssueWithIdentifier`（SWR revalidation 触发）会写入 `issuesMap`：
-
-| 拉取操作 | 写入 store | 写入 issuesMap？ | 效果 |
-|----------|-----------|-----------------|------|
-| SWR revalidation → `fetchIssueWithIdentifier` | `addIssue()` | ✅ 浅合并覆盖 | 修正所有字段（含服务端计算字段），但也覆盖本地未提交修改 |
-| `fetchActivities`（手动触发） | `activityMap` + `activities` | ❌ | 只修正活动流，不影响 issue 字段 |
-| `fetchParentStats`（编辑者 A-⑥） | 统计 store | ❌ | 只修正父级统计 |
-| `fetchComments` | `commentMap` | ❌ | 只修正评论列表 |
-| `fetchReactions` / `fetchLinks` / `fetchAttachments` / `fetchSubIssues` / `fetchRelations` | 各自子 store | ❌ | 只修正对应子资源 |
-
-**结论**：其他客户端的 `issuesMap` **只能通过 `fetchIssueWithIdentifier`（SWR revalidation）修正**。所有其他拉取操作都只影响各自的子 store，不触及 issue 字段。
 
 ---
 
@@ -693,10 +772,12 @@ issueOperations.update() → BaseIssuesStore.issueUpdate()
 | Page 实时事件 | [use-realtime-page-events.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/hooks/use-realtime-page-events.tsx) | Page 实时事件处理 hook |
 | Page 协作动作 | [use-collaborative-page-actions.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/hooks/use-collaborative-page-actions.tsx) | Page 协作操作 hook |
 | Issue 全局 store | [issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/issue/issue.store.ts) | issuesMap 单一数据源、addItem/updateIssue/removeIssue |
-| Issue 详情 store | [issue-details/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/issue/issue-details/issue.store.ts) | Issue fetch/update 路由（委托给 ProjectIssues） |
+| Issue 详情 store | [issue-details/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/issue/issue-details/issue.store.ts) | Issue fetch/update 路由（Promise.all 并行 issueUpdate + fetchActivities） |
 | Issue 活动流 store | [activity.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/ce/store/issue/issue-details/activity.store.ts) | fetchActivities 增量拉取 + activityMap 管理 |
 | Issue 详情 root | [issue-details/root.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/issue/issue-details/root.store.ts) | IssueDetail 聚合 store（issue+activity+comment+...） |
-| Issue 乐观更新 | [base-issues.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/issue/helpers/base-issues.store.ts) | issueUpdate 乐观更新+回滚逻辑 |
+| Issue 乐观更新 | [base-issues.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/issue/helpers/base-issues.store.ts) | issueUpdate 乐观更新+回滚+fetchParentStats 逻辑 |
+| Project store | [project.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/project/project.store.ts) | fetchProjectDetails（fetchParentStats 的写入目标：projectMap） |
+| Project issues store | [project/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/store/issue/project/issue.store.ts) | fetchParentStats → project.fetchProjectDetails |
 | Issue 描述编辑 | [description-input/root.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/components/editor/rich-text/description-input/root.tsx) | Issue 描述编辑器 (非协作, 1500ms debounce) |
 | Issue 主内容 | [main-content.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/core/components/issues/issue-detail/main-content.tsx) | Issue 详情页主内容区 |
 | Issue 详情页 | [browse/page.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/197-plane/apps/web/app/(all)/[workspaceSlug]/(projects)/projects/(detail)/browse/[workItem]/page.tsx) | SWR+fetchIssueWithIdentifier 加载入口 |
