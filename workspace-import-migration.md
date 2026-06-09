@@ -438,13 +438,165 @@ class Meta:
 
 ### 5.3 附件映射
 
-`FileAsset` 模型有 `external_source` + `external_id`。附件导入需要：
+`IssueAttachment` 模型（继承自 `ProjectBaseModel`）和 `FileAsset` 模型均有 `external_source` + `external_id` 字段。附件的迁移链路比评论和链接更复杂，涉及文件二进制上传：
 
-1. 从源系统下载附件文件
-2. 通过 FileAsset 上传接口上传至 Plane 的 S3 存储
-3. 记录 `external_source` / `external_id` 便于后续增量同步时去重
+**API v1 附件创建端点**（可达）：
 
-### 5.4 State 映射
+```
+POST /api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/
+```
+
+这是一个**两阶段上传**流程：
+
+1. **阶段一：创建 FileAsset 记录 + 获取预签名 URL**
+   - 请求体：`{ name, type, size, external_id?, external_source? }`
+   - 服务端校验 MIME 类型（`ATTACHMENT_MIME_TYPES` 白名单）和文件大小（`FILE_SIZE_LIMIT`）
+   - 如果提供 `external_id` + `external_source`，先查询 `FileAsset` 去重：
+     - 匹配条件：`project_id` + `workspace__slug` + `external_source` + `external_id` + `issue_id` + `entity_type=ISSUE_ATTACHMENT`
+     - 已存在 → 返回 `409 Conflict` + 已有 asset ID
+     - 不存在 → 创建 `FileAsset` 记录（含 `external_id`/`external_source`）
+   - 生成 S3 预签名 POST URL
+   - 返回 `{ upload_data: { url, fields }, asset_id, attachment, asset_url }`
+   - **注意：此阶段返回 200（非 201），因为文件尚未上传**
+
+2. **阶段二：客户端直传 S3**
+   - 使用预签名 URL 将文件二进制直接上传至 S3
+   - 上传完成后 S3 不会通知 Plane 后端
+
+3. **阶段三：确认上传（由其他机制触发）**
+   - `FileAsset.is_uploaded` 字段默认 `False`
+   - 列表端点 GET 只返回 `is_uploaded=True` 的附件
+   - 需要额外的确认机制将 `is_uploaded` 设为 `True`
+
+**迁移注意事项：**
+- 附件创建不支持覆盖 `created_at` 和 `created_by`，始终使用当前时间和当前 API Key 用户
+- `external_id` 去重范围是 project + issue 级别，同文件挂到不同 issue 不冲突
+- 需先从源系统下载文件到本地，再通过预签名 URL 上传至 S3
+
+### 5.4 评论映射
+
+`IssueComment` 模型拥有 `external_source` + `external_id` 字段，且 API v1 端点对迁移场景提供了**最完整的支持**：
+
+**API v1 评论创建端点**（可达）：
+
+```
+POST /api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/comments/
+```
+
+**external_id 去重机制：**
+
+```python
+# issue.py L1422-L1444
+if request.data.get("external_id") and request.data.get("external_source"):
+    if IssueComment.objects.filter(
+        project_id=project_id,
+        workspace__slug=slug,
+        external_source=request.data.get("external_source"),
+        external_id=request.data.get("external_id"),
+    ).exists():
+        return Response(
+            {"error": "...", "id": str(issue_comment.id)},
+            status=status.HTTP_409_CONFLICT,
+        )
+```
+
+- 匹配范围：`project_id` + `workspace` + `external_source` + `external_id`（**不限定 issue_id**，即同一 external_id 在不同 issue 下也会冲突）
+- 冲突时返回 `409` + 已有 comment ID
+
+**源时间和作者信息保留：**
+
+评论是三种关联资源中**唯一支持覆盖 `created_at`、`created_by` 和 `actor` 的**：
+
+```python
+# issue.py L1449-L1454
+issue_comment = IssueComment.objects.get(pk=serializer.instance.id)
+issue_comment.created_at = request.data.get("created_at", timezone.now())
+issue_comment.created_by_id = request.data.get("created_by", request.user.id)
+issue_comment.actor_id = request.data.get("created_by", request.user.id)
+issue_comment.save(update_fields=["created_at", "created_by"])
+```
+
+- `created_at`：可传入源系统的创建时间，默认当前时间
+- `created_by` / `actor_id`：可传入源系统用户映射后的 Plane UUID，默认当前 API Key 用户
+- 注意：`actor` 字段在 serializer 的 `read_only_fields` 中，但 View 在 `serializer.save()` 之后手动覆盖了 `actor_id`，绕过了 serializer 的只读限制
+
+**PATCH 更新时的 external_id 唯一性校验：**
+
+```python
+# issue.py L1575-L1591 (IssueCommentDetailAPIEndpoint.patch)
+if (
+    request.data.get("external_id")
+    and (issue_comment.external_id != str(request.data.get("external_id")))
+    and IssueComment.objects.filter(...).exists()
+):
+    return Response({"error": "...", "id": str(issue_comment.id)}, status=status.HTTP_409_CONFLICT)
+```
+
+仅在 `external_id` 值发生变更时校验唯一性，同值更新不触发冲突检查。
+
+**请求体字段（`IssueCommentCreateSerializer`）：**
+
+| 字段 | 可写 | 说明 |
+|------|------|------|
+| `comment_html` | ✅ | HTML 格式评论内容 |
+| `comment_json` | ✅ | JSON 格式评论内容（富文本结构化） |
+| `access` | ✅ | `"INTERNAL"` 或 `"EXTERNAL"` |
+| `external_source` | ✅ | 来源系统标识 |
+| `external_id` | ✅ | 源系统唯一标识 |
+| `created_at` | ⚠️ | serializer 只读，但 View 在 save 后手动覆盖 |
+| `created_by` | ⚠️ | serializer 只读，但 View 在 save 后手动覆盖 |
+
+### 5.5 链接映射
+
+`IssueLink` 模型**没有** `external_source` 和 `external_id` 字段，是三种关联资源中**唯一不具备外部 ID 追踪能力**的。
+
+**API v1 链接创建端点**（可达）：
+
+```
+POST /api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/links/
+```
+
+**去重机制 — 基于 URL + Issue 唯一约束：**
+
+```python
+# serializers/issue.py L428-L431 (IssueLinkCreateSerializer.create)
+def create(self, validated_data):
+    if IssueLink.objects.filter(url=validated_data.get("url"), issue_id=validated_data.get("issue_id")).exists():
+        raise serializers.ValidationError({"error": "URL already exists for this Issue"})
+    return IssueLink.objects.create(**validated_data)
+```
+
+- 匹配条件：`url` + `issue_id` 组合唯一
+- 冲突时抛出 `ValidationError`，返回 `400 Bad Request`（**不是 409**）
+- 同一 URL 可以挂到不同 issue 下
+
+**源时间和作者信息保留：**
+
+链接创建**不支持覆盖 `created_at`**，但**支持覆盖 `created_by`**：
+
+```python
+# issue.py L1167-L1168
+link.created_by_id = request.data.get("created_by", request.user.id)
+link.save(update_fields=["created_by"])
+```
+
+- `created_by`：可传入源系统用户映射后的 Plane UUID
+- `created_at`：始终使用当前时间，无法覆盖
+- `created_by` 在 serializer 的 `read_only_fields` 中，View 在 `save()` 后手动覆盖（与 Comment 模式相同）
+
+**请求体字段（`IssueLinkCreateSerializer`）：**
+
+| 字段 | 可写 | 说明 |
+|------|------|------|
+| `title` | ✅ | 链接标题 |
+| `url` | ✅ | 链接 URL（需 http/https 协议） |
+| `issue_id` | ✅ | 所属 issue（serializer 字段，但实际由 URL 路径参数覆盖） |
+| `external_source` | ❌ | 模型无此字段 |
+| `external_id` | ❌ | 模型无此字段 |
+| `created_at` | ❌ | 无法覆盖 |
+| `created_by` | ⚠️ | serializer 只读，但 View 在 save 后手动覆盖 |
+
+### 5.6 State 映射
 
 State 模型拥有 `external_source` / `external_id` 以及 `group` 字段（backlog/unstarted/started/completed/cancelled）。导入策略通常为：
 
@@ -452,9 +604,34 @@ State 模型拥有 `external_source` / `external_id` 以及 `group` 字段（bac
 - 同一 group 下可创建多个 State（如 Jira 的 "In Progress" → Plane State group="started", name="In Progress"）
 - 通过 `external_id` 避免重复创建
 
-### 5.5 Module / Cycle 映射
+### 5.7 Module / Cycle 映射
 
 Module 和 Cycle 模型均有 `external_source` / `external_id`。Jira 导入时可配置 `epics_to_modules: true`，将 Jira Epic 映射为 Plane Module。
+
+### 5.8 关联资源迁移边界对比
+
+| 维度 | IssueComment | FileAsset / IssueAttachment | IssueLink |
+|------|-------------|---------------------------|-----------|
+| **模型 external_source** | ✅ 有 | ✅ 有（FileAsset + IssueAttachment 双模型均有） | ❌ 无 |
+| **模型 external_id** | ✅ 有 | ✅ 有（FileAsset + IssueAttachment 双模型均有） | ❌ 无 |
+| **Serializer 接受 external_id** | ✅ 可写字段 | ✅ `IssueAttachmentUploadSerializer` 可写 | ❌ 模型无此字段 |
+| **POST 创建去重** | ✅ 409 + 已有 ID | ✅ 409 + 已有 ID | ⚠️ 400（URL+issue 唯一） |
+| **去重键** | project + workspace + external_source + external_id | project + workspace + external_source + external_id + issue_id + entity_type | url + issue_id |
+| **PATCH 更新 external_id 校验** | ✅ 变更时校验 409 | ❌ 无 PATCH 外部 ID 校验逻辑 | ❌ 无 external_id |
+| **覆盖 created_at** | ✅ View 手动覆盖 | ❌ 无法覆盖 | ❌ 无法覆盖 |
+| **覆盖 created_by** | ✅ View 手动覆盖 | ❌ 始终 request.user | ⚠️ View 手动覆盖 |
+| **覆盖 actor** | ✅ View 手动覆盖 | N/A | N/A |
+| **幂等重入** | ✅ POST + external_id 409 → PATCH by pk | ⚠️ POST + external_id 409 → 无法 PATCH 更新内容 | ❌ 仅 URL 去重，无外部 ID |
+| **失败补偿** | 409 时拿 ID → PATCH 更新内容 | 409 时拿 ID → 但文件已存在无需重传 | 400 时需自行判断是 URL 重复还是其他错误 |
+| **上传复杂度** | 简单 JSON 提交 | 两阶段：预签名 URL → 直传 S3 → 确认 is_uploaded | 简单 JSON 提交 |
+
+**关键差异总结：**
+
+1. **IssueComment 是迁移友好度最高的关联资源**：有 external_id 去重、支持覆盖 created_at/created_by/actor、409 冲突返回已有 ID 可用于 PATCH 更新。
+
+2. **FileAsset/Attachment 迁移需关注两阶段上传的完整性**：预签名 URL 机制意味着迁移工具需自行处理文件下载→S3 上传→确认上传完成的三步流程。`is_uploaded=False` 的附件不会出现在列表中，静默丢失。此外，附件创建不支持覆盖 `created_at` 和 `created_by`，无法保留源系统的时间和作者。
+
+3. **IssueLink 是迁移最薄弱的关联资源**：无 external_id/external_source 字段，无法通过外部标识去重或追踪来源。去重仅基于 URL + issue_id 组合，返回 400 而非 409（无法区分"URL 重复"和"其他验证错误"），不支持覆盖 created_at。迁移时需在调用方自行维护"源 URL → Plane link ID"映射表。
 
 ---
 
