@@ -164,9 +164,11 @@ PATCH  /api/assets/v2/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/
 DELETE /api/assets/v2/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/attachments/{pk}/
 ```
 
-**App 侧 issue-attachments（V1，已弃用但路由仍存在）**
+**App 侧 issue-attachments（V1）**
 
 代码：`apps/api/plane/app/views/issue/attachment.py` → `IssueAttachmentEndpoint`
+
+路由注册于 `apps/api/plane/app/urls/issue.py`，URL 模式为 `workspaces/<str:slug>/projects/<uuid:project_id>/issues/<uuid:issue_id>/issue-attachments/` 及其 `/<uuid:pk>/` 子路径，当前仍处于活跃注册状态。
 
 ```
 POST   /api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/
@@ -271,22 +273,65 @@ def user_has_issue_permission(user_id, project_id, issue=None, allowed_roles=Non
 **2. V1 端点是唯一在 DELETE 查询中包含 issue_id 的版本**
 
 ```python
-# V1 (IssueAttachmentEndpoint.delete)
+# V1 (IssueAttachmentEndpoint.delete) — apps/api/plane/app/views/issue/attachment.py
 issue_attachment = FileAsset.objects.filter(
     pk=pk, workspace__slug=slug, project_id=project_id, issue_id=issue_id
 ).first()
 
-# V2 (IssueAttachmentV2Endpoint.delete)
+# V2 (IssueAttachmentV2Endpoint.delete) — 同文件
 issue_attachment = FileAsset.objects.get(
     pk=pk, workspace__slug=slug, project_id=project_id
 )
 ```
 
-V1 的 DELETE 操作在数据库查询层面限制了 asset 必须属于指定 issue，但 V1 已为弃用路径，且执行硬删除。
+V1 的 DELETE 操作在数据库查询层面限制了 asset 必须属于指定 issue，这在所有版本中是唯一的。V1 同时也是唯一执行硬删除（`asset.delete()` + DB 记录删除）的版本，V2 和 API 侧均为软删除。V1 的路由当前仍处于活跃注册状态。
 
 **3. API 侧 DELETE 的角色范围更宽**
 
 App V2 的 DELETE 仅允许 ADMIN 或资源创建者，API 侧则允许所有项目角色（ADMIN/MEMBER/GUEST）加上 issue 创建者。这意味着 GUEST 用户在 API 侧可以删除附件，但在 App V2 侧不行。
+
+### 5.8 API 侧 issue 创建者规则与 asset 查询不含 issue_id 的组合影响
+
+API 侧的 PATCH（确认上传）和 DELETE 操作存在一个权限与查询不匹配的组合问题：
+
+**代码执行流程**（以 DELETE 为例，PATCH 同理）：
+
+```python
+# 步骤 1：从 URL 中的 issue_id 获取 issue 对象
+issue = Issue.objects.get(pk=issue_id, workspace__slug=slug, project_id=project_id)
+
+# 步骤 2：权限校验 — 检查用户是否为该 issue 的创建者
+if not user_has_issue_permission(
+    request.user.id,
+    project_id=project_id,
+    issue=issue,                    # ← 校验的是 URL 中 issue 的创建者
+    allowed_roles=[ROLE.ADMIN.value, ROLE.MEMBER.value, ROLE.GUEST.value],
+    allow_creator=True,
+):
+    return Response({"error": "..."}, status=status.HTTP_403_FORBIDDEN)
+
+# 步骤 3：查询 asset — 不含 issue_id
+issue_attachment = FileAsset.objects.get(pk=pk, workspace__slug=slug, project_id=project_id)
+#                                ↑ pk 来自请求，可以是项目中任意 asset
+```
+
+**组合效果**：步骤 2 校验的是 URL 中 issue 的创建者身份，步骤 3 查询的 asset 却不限定属于该 issue。两者解耦导致：
+
+> **非项目成员的 issue 创建者，可以借自己创建的 issue URL 对同项目其他 issue 的附件执行确认上传（PATCH）或删除（DELETE）操作。**
+
+**具体场景推演**：
+
+假设项目 P 中存在 issue A（由用户 X 创建）和 issue B（由用户 Y 创建），issue B 有附件 asset_Z。
+
+| 用户 | 项目成员身份 | 操作 | 结果 |
+|------|-------------|------|------|
+| X（issue A 创建者） | ❌ 不是项目成员 | `DELETE /api/.../work-items/{issue_A_id}/attachments/{asset_Z}/` | ✅ 成功 — `user_has_issue_permission(issue=issue_A)` 因 X 是 A 的创建者放行；`FileAsset.objects.get(pk=asset_Z, project_id=P)` 不含 issue_id 过滤，查到 issue B 的附件并删除 |
+| X（issue A 创建者） | ❌ 不是项目成员 | `PATCH /api/.../work-items/{issue_A_id}/attachments/{asset_Z}/` | ✅ 成功 — 同上逻辑，X 可确认 issue B 的附件上传 |
+| X（issue A 创建者） | ❌ 不是项目成员 | `DELETE /api/.../work-items/{issue_A_id}/attachments/{asset_Z}/`（App V2 侧） | ❌ 失败 — App V2 使用 `@allow_permission([ADMIN], creator=True, model=FileAsset)`，creator 语义为 FileAsset 的 `created_by` 而非 issue 的 `created_by`，X 不是 asset_Z 的创建者也不是项目成员 |
+
+**根因**：API 侧的 `user_has_issue_permission` 以 URL 中的 issue 对象做权限判定，但 FileAsset 查询不以 issue_id 做范围限定，权限校验的对象与实际操作的对象不一致。
+
+**对比 App 侧**：App V2 的 `@allow_permission` 使用 `creator=True, model=FileAsset`，creator 语义为 FileAsset 的 `created_by`，且要求同时是工作区成员。App V1 的 DELETE 查询包含 `issue_id`，即使权限通过，数据库层面也限制了 asset 必须属于指定 issue。因此 App 侧不存在此组合问题。
 
 ---
 
@@ -411,7 +456,7 @@ def user_has_issue_permission(user_id, project_id, issue=None, allowed_roles=Non
 
 ### 7.3 issue_id 在附件端点中的实际作用范围
 
-> **核心发现：所有端点（App V2、API 侧）的单个资源操作（下载/删除/确认上传）均不基于 `issue_id` 进行权限限制。** 虽然 URL 中包含 `issue_id` 参数，但实际查询只使用 `(pk, workspace__slug, project_id)` 三元组（App V2 / API 侧），或 `(pk, workspace__slug, project_id, issue_id)` 四元组（仅 App V1 DELETE）。
+> **核心发现：App V2 和 API 侧的单个资源操作（下载/删除/确认上传）均不基于 `issue_id` 进行权限限制。** 虽然 URL 中包含 `issue_id` 参数，但实际查询只使用 `(pk, workspace__slug, project_id)` 三元组。App V1 的 DELETE 是唯一使用 `(pk, workspace__slug, project_id, issue_id)` 四元组的操作。
 
 各操作的查询条件总结：
 
@@ -431,7 +476,7 @@ def user_has_issue_permission(user_id, project_id, issue=None, allowed_roles=Non
 |------|----------|-------------|
 | POST | N/A（创建时写入） | — |
 | GET 列表 | `issue_id + workspace__slug + project_id` | ✅ 用于过滤 |
-| DELETE | `pk + workspace__slug + project_id + issue_id` | ✅ **V1 是唯一在 DELETE 中含 issue_id 的版本** |
+| DELETE | `pk + workspace__slug + project_id + issue_id` | ✅ **V1 DELETE 是所有端点中唯一在 asset 查询中含 issue_id 的操作** |
 
 **API 侧 — `IssueAttachmentDetailAPIEndpoint`**
 
@@ -443,19 +488,24 @@ def user_has_issue_permission(user_id, project_id, issue=None, allowed_roles=Non
 | PATCH | `pk + workspace__slug + project_id` | ❌ |
 | DELETE | `pk + workspace__slug + project_id` | ❌ |
 
-### 7.4 项目内跨工单 asset 访问范围
+### 7.4 项目内跨工单 asset 访问与变更范围
 
-由于单个资源操作不校验 `issue_id`，**项目级边界是附件访问的最小隔离单元**。具体表现为：
+由于单个资源操作不校验 `issue_id`，**项目级边界是附件访问与变更的最小隔离单元**。具体表现为：
 
 | 场景 | 是否可行 | 说明 |
 |------|----------|------|
 | 同一工单内下载其他附件 | ✅ | 正常行为 |
 | 同项目不同工单间，用 asset_id 下载附件 | ✅ | 查询不含 issue_id，仅校验项目成员 |
+| 同项目不同工单间，用 asset_id 删除/确认上传附件（API 侧，issue 创建者） | ✅ | 5.8 节详述：issue 创建者可借自己 issue 的 URL 变更其他 issue 的附件 |
 | 跨项目用 asset_id 下载附件 | ✅ 可通过 `WorkspaceAssetDownloadEndpoint` 绕过 | 6.3 节详述 |
 | 跨项目用 asset_id 通过 issue URL 下载 | ❌ | `project_id` 为查询条件，且权限守卫校验项目成员身份 |
 | 跨工作区用 asset_id 下载附件 | ❌ | `workspace__slug` 为查询条件，所有端点均校验工作区范围 |
 
-**影响评估**：同项目成员本就有权访问项目内所有工单，因此通过 issue URL 的跨工单访问不构成权限越级。但 `WorkspaceAssetDownloadEndpoint` 允许工作区成员（无需是项目成员）下载项目内 `ISSUE_ATTACHMENT`，这在设计上可能是一个权限泄漏点。
+**影响评估**：
+
+- 同项目成员本就有权访问项目内所有工单，因此通过 issue URL 的跨工单**只读**访问不构成权限越级。
+- 但 API 侧的跨工单**变更**（删除、确认上传）可被非项目成员的 issue 创建者利用，如 5.8 节所述，这在设计上是一个权限泄漏点。
+- `WorkspaceAssetDownloadEndpoint` 允许工作区成员（无需是项目成员）下载项目内 `ISSUE_ATTACHMENT`，这也是一个潜在的权限泄漏点。
 
 ### 7.5 下载流程
 
@@ -499,7 +549,7 @@ def user_has_issue_permission(user_id, project_id, issue=None, allowed_roles=Non
 
 ### 9.2 项目级隔离（非工单级）
 
-如第 7.4 节所述，附件访问的最小隔离单元是**项目**而非工单。URL 中虽然包含 `issue_id`，但单个资源操作（下载、确认上传、删除）的数据库查询均不使用 `issue_id` 作为过滤条件（V1 DELETE 除外）。权限隔离依赖 `workspace__slug + project_id` 双重约束和 `@allow_permission` 的项目成员校验。
+如第 7.4 节所述，附件访问与变更的最小隔离单元是**项目**而非工单。URL 中虽然包含 `issue_id`，但 App V2 和 API 侧的单个资源操作（下载、确认上传、删除）的数据库查询均不使用 `issue_id` 作为过滤条件。App V1 的 DELETE 是唯一的例外，其查询包含 `issue_id`。权限隔离主要依赖 `workspace__slug + project_id` 双重约束和权限守卫的成员校验。
 
 ### 9.3 DuplicateAssetEndpoint 的跨工作区边界
 
@@ -609,7 +659,8 @@ validateFilename(filename)  →  返回 string | null
 | **签名上传** | 预签名 POST 包含 bucket/key/Content-Type/content-length-range 条件约束 |
 | **签名下载** | 所有下载通过后端重定向至临时签名 URL，签名默认 1 小时过期 |
 | **权限分层** | PROJECT 级（工单附件）和 WORKSPACE 级（工作区资产）两级权限控制 |
-| **权限粒度** | 附件访问隔离粒度为**项目级**，非工单级。同项目内用户可通过 asset_id 访问任意工单的附件 |
+| **权限粒度** | 附件访问与变更隔离粒度为**项目级**，非工单级。同项目内用户可通过 asset_id 访问任意工单的附件 |
+| **跨工单变更** | API 侧 `user_has_issue_permission(issue=issue, allow_creator=True)` 与 `FileAsset` 查询不含 `issue_id` 组合，导致非项目成员的 issue 创建者可变更同项目其他 issue 的附件（5.8 节） |
 | **Download 端点绕过** | `WorkspaceAssetDownloadEndpoint` 和 `ProjectAssetDownloadEndpoint` 不按 `entity_type` 过滤，工作区/项目成员可绕过 issue URL 下载 `ISSUE_ATTACHMENT` 资产 |
 | **角色控制** | ADMIN/MEMBER/GUEST 三级角色，App V2 删除操作仅 ADMIN 或创建者；API 侧删除允许所有角色 + issue 创建者 |
 | **工作区隔离** | 存储键包含 workspace_id，查询均限定工作区范围 |
