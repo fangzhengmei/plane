@@ -462,7 +462,7 @@ Service 层 (IssueService)     ← HTTP 请求、URL 路由
 后端 API
 ```
 
-核心服务类为 [IssueService](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/issue/issue.service.ts)，继承自 [APIService](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/services/src/api.service.ts)（axios 封装）。
+核心服务类为 [IssueService](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/issue/issue.service.ts)，继承自 web app 自己的 [APIService](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/api.service.ts)（axios 封装 + 401 拦截器），**不是** `packages/services/src/api.service.ts`。后者的 `SitesIssueService` 仅用于公共 Sites 场景，web 前端不使用它。
 
 ### 11.2 EIssueServiceType — 服务类型路由
 
@@ -508,7 +508,11 @@ async getIssuesFromServer(workspaceSlug, projectId, queries?, config = {}) {
 }
 ```
 
-**关键逻辑**：当 `expand` 包含 `issue_relation` 且无 `group_by` 时，路由到 `-detail/` 端点（[IssueDetailEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/views/issue/base.py#L963)），该端点使用 `IssueListDetailSerializer`；否则路由到普通列表端点，使用 `.values()` 或 `IssueSerializer`。
+**关键逻辑**：当 `expand` 包含 `issue_relation` 且无 `group_by` 时，路由到 `-detail/` 端点（[IssueDetailEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/views/issue/base.py#L963)），该端点使用 `IssueListDetailSerializer`；否则路由到普通列表端点 `IssueViewSet.list`。
+
+**重要澄清**：两条路径都能处理 expand，但序列化器不同：
+- **`-detail/` 端点**（`IssueDetailEndpoint`）：始终使用 `IssueListDetailSerializer`，内部手动处理 `issue_relation`/`issue_related` 展开
+- **普通列表端点**（`IssueViewSet.list`）：当请求带 `expand` 参数时走 `IssueSerializer(issue_queryset, many=True, fields=self.fields, expand=self.expand)`；当不带 `expand` 也不带 `fields` 时走 `.values()` 快速路径。即 `if self.fields or self.expand:` 决定了是否进入序列化器
 
 同样，[WorkspaceService.getViewIssues](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/workspace.service.ts#L272-L275) 有相同逻辑：
 
@@ -546,7 +550,7 @@ if (ENABLE_ISSUE_DEPENDENCIES && displayFilters?.layout === EIssueLayoutTypes.GA
     issueFiltersParams["expand"] = "issue_relation,issue_related";
 ```
 
-其他布局（Kanban、List、Calendar）**不传 expand 参数**，因此走 `.values()` 快速路径。
+其他布局（Kanban、List、Calendar）**不传 expand 参数**，因此走 `.values()` 快速路径（因为 `IssueViewSet.list` 中 `if self.fields or self.expand:` 为 False）。
 
 ### 11.6 Inbox 请求的 expand 参数
 
@@ -755,22 +759,42 @@ app 层 mapper（[app/serializers/base.py#L74-L96](file:///d:/fz/0508-3/solo-dog
 
 **风险**：如果有人误将 `expand=issue_inbox` 传给普通 issue 端点，`DynamicBaseSerializer._filter_fields` 不会识别这个 expand 值，会静默忽略。
 
-### 13.5 `issue_attachments` vs `issue_attachment` 命名差异
+### 13.5 `issue_attachments` 与 `issue_attachment` 的完整处理流程
 
-前端请求 `expand=issue_attachments`（复数），后端 mapper 注册的是 `issue_attachment`（单数）。但在 `DynamicBaseSerializer.to_representation` 中有特殊处理：
+前端请求 `expand=issue_attachments`（复数），传入后端 `DynamicBaseSerializer.__init__` 后 `self.expand = ["issue_reactions", "issue_attachments", "issue_link", "parent"]`。
 
-```python
-if "issue_attachments" in self.expand:
-    # 手动查询 FileAsset
-```
+在 `_filter_fields` 阶段：
+- `issue_attachments` 不在 `self.fields` 中（Issue 模型没有此字段）
+- expansion mapper（第74-96行）中**也没有** `issue_attachments` 这个 key（mapper 只有 `issue_reactions`、`issue_link`、`sub_issues` 等）
+- `many=True` 列表（第103-115行）中的 `"issue_attachment"` 是单数形式，仅用于标记哪些 expand 字段是 many 关系，并非 mapper key
+- 因此 `_filter_fields` **无法通过 mapper 添加** `issue_attachments` 字段，该字段在 `self.fields` 中不存在
 
-所以 mapper 中的 key 是 `issue_attachment`（用于 `_filter_fields` 阶段添加字段），但 `to_representation` 阶段检查的是 `issue_attachments`（复数）。**两者同时存在且必须同时修改**，否则会出现字段被添加但数据不被展开的情况。
+在 `to_representation` 阶段：
+- expansion mapper（第148-171行）使用的 key 是 `"issue_attachment"`（单数），映射到 `IssueAttachmentLiteSerializer`
+- 但 `self.expand` 中包含的是 `"issue_attachments"`（复数），不匹配 mapper key `"issue_attachment"`
+- 在第173行 `if expand in expansion:` 判断时，`"issue_attachments"` ≠ `"issue_attachment"`，不会走序列化器展开
+- 但在第184行有**特殊处理**：`if "issue_attachments" in self.fields or "issue_attachments" in self.expand:` 直接查询 `FileAsset` 模型，用 `IssueAttachmentLiteSerializer` 序列化后写入 `response["issue_attachments"]`
 
-### 13.6 列表接口不支持 expand 的路径
+**总结**：前端发 `issue_attachments` → `_filter_fields` 阶段无法添加该字段 → `to_representation` 阶段 expansion mapper 也不匹配 → **完全依赖第184-199行的特殊 FileAsset 查询逻辑**。mapper 中的 `"issue_attachment"`（单数）在当前前端请求路径下不会被触发。
 
-当列表请求**不含** expand 时（普通 Kanban/List/Calendar 布局），请求走 `IssueViewSet.list` → `issue_on_results` → `.values()` 路径，**完全绕过序列化器和 expansion mapper**。此时前端传入的任何 expand 参数都会被忽略（因为 `.values()` 不处理 expand）。
+### 13.6 列表接口中 expand 参数的完整处理路径
 
-**只有在 Gantt 布局或包含 `issue_relation` 的 expand 请求时**，才会路由到 `IssueDetailEndpoint`，该端点使用 `IssueListDetailSerializer` 处理 expand。
+前端列表请求有两种情况：
+
+**情况 A：不带 expand 也不带 fields（Kanban/List/Calendar 布局）**
+- 前端 `IssueFilterHelperStore.computedFilteredParams` 不添加 expand 参数
+- `IssueService.getIssuesFromServer` 路由到普通 `/issues/` 端点
+- 后端 `IssueViewSet.list` 中 `if self.fields or self.expand:` 为 False
+- 走 `.values()` 快速路径，**完全绕过序列化器和 expansion mapper**
+- 此时返回的是原始字典，字段名由 `.values()` 硬编码列表决定
+
+**情况 B：带 expand 参数（Gantt 布局，expand 含 `issue_relation,issue_related`）**
+- 前端 `computedFilteredParams` 添加 `expand: "issue_relation,issue_related"`
+- `IssueService.getIssuesFromServer` 检测到 `issue_relation` 且无 `group_by`，路由到 `/issues-detail/` 端点
+- 后端 `IssueDetailEndpoint` 使用 `IssueListDetailSerializer` 处理 expand
+- `IssueListDetailSerializer` 不继承 `DynamicBaseSerializer`，**不走通用 expansion mapper**，而是在 `to_representation` 中手动处理 `issue_relation` 和 `issue_related`
+
+**注意**：如果前端在普通布局（非 Gantt）下传了 expand 参数（如 `expand=state`），但不含 `issue_relation`，则路由到 `IssueViewSet.list`，此时 `self.expand` 非空，走 `IssueSerializer(issue_queryset, many=True, fields=self.fields, expand=self.expand)` 路径，**会经过 `DynamicBaseSerializer` 的 expansion mapper 展开**。
 
 ---
 
@@ -866,8 +890,9 @@ if "issue_attachments" in self.expand:
 | [packages/types/src/issues/issue_attachment.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue_attachment.ts) | 前端 TIssueAttachment 类型 |
 | [packages/types/src/issues/issue_link.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue_link.ts) | 前端 TIssueLink 类型 |
 | [packages/types/src/issues/issue_reaction.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue_reaction.ts) | 前端 TIssueReaction 类型 |
-| [packages/services/src/api.service.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/services/src/api.service.ts) | 基础 HTTP 服务 (axios 封装) |
+| [packages/services/src/api.service.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/services/src/api.service.ts) | 公共包 APIService 基类 (仅 Sites 场景使用，web 前端不用) |
 | [services/issue/issue.service.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/issue/issue.service.ts) | 前端 IssueService (列表/详情/CRUD) |
+| [services/api.service.ts (web app)](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/api.service.ts) | web 前端 APIService 基类 (axios + 401 拦截) |
 | [services/inbox/inbox-issue.service.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/inbox/inbox-issue.service.ts) | 前端 InboxIssueService |
 | [store/issue/root.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/root.store.ts) | IssueRootStore (顶层状态管理) |
 | [store/issue/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/issue.store.ts) | 全局 issuesMap (TIssue 字典) |
