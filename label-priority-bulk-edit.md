@@ -10,7 +10,7 @@
 
 ### 1.1 tsconfig.json 路径映射
 
-[tsconfig.json](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/tsconfig.json#L4-L11) 定义了路径别名：
+`apps/web/tsconfig.json` 定义了路径别名：
 
 ```json
 {
@@ -29,8 +29,8 @@
 `ce/` 目录存放社区版的**可替换实现**，`core/` 中的代码通过 `@/plane-web/*` 别名导入这些实现。这种设计允许 Plane One 付费版通过替换 `ce/` 为自己的目录来提供增强功能。当前仓库只包含 `ce/` 实现。
 
 与批量操作相关的 `ce/` 文件：
-- [ce/hooks/use-bulk-operation-status.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/ce/hooks/use-bulk-operation-status.ts) — 始终返回 `false`
-- [ce/components/issues/bulk-operations/root.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/ce/components/issues/bulk-operations/root.tsx) — 渲染升级横幅
+- `ce/hooks/use-bulk-operation-status.ts` — 始终返回 `false`
+- `ce/components/issues/bulk-operations/root.tsx` — 渲染升级横幅
 
 `ce/` 目录**不是付费版目录**，它就是当前仓库运行时实际使用的代码。付费版的替换目录不在本仓库中。
 
@@ -42,9 +42,9 @@
 
 | 布局 | IssueBulkOperationsRoot 位置 | useBulkOperationStatus 位置 | disabled 控制方式 |
 |------|---------------------------|---------------------------|-----------------|
-| **Spreadsheet** | [spreadsheet-view.tsx#L124](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/issue-layouts/spreadsheet/spreadsheet-view.tsx#L124) | [spreadsheet-view.tsx#L68](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/issue-layouts/spreadsheet/spreadsheet-view.tsx#L68) | `disabled={!isBulkOperationsEnabled \|\| isEpic}` 传给 `MultipleSelectGroup` |
-| **List** | [default.tsx#L175](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/issue-layouts/list/default.tsx#L175) | [default.tsx#L86](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/issue-layouts/list/default.tsx#L86) | `disabled={!isBulkOperationsEnabled \|\| isEpic}` 传给 `MultipleSelectGroup` |
-| **Gantt** | [main-content.tsx#L241](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/gantt-chart/chart/main-content.tsx#L241) | [main-content.tsx#L98](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/gantt-chart/chart/main-content.tsx#L98) + [base-gantt-root.tsx#L62](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/issue-layouts/gantt/base-gantt-root.tsx#L62) | `disabled={!isBulkOperationsEnabled \|\| isEpic}` (main-content) + `enableSelection={isBulkOperationsEnabled && isAllowed}` (base-gantt-root) |
+| **Spreadsheet** | `core/components/issues/issue-layouts/spreadsheet/spreadsheet-view.tsx#L124` | `core/components/issues/issue-layouts/spreadsheet/spreadsheet-view.tsx#L68` | `disabled={!isBulkOperationsEnabled \|\| isEpic}` 传给 `MultipleSelectGroup` |
+| **List** | `core/components/issues/issue-layouts/list/default.tsx#L175` | `core/components/issues/issue-layouts/list/default.tsx#L86` | `disabled={!isBulkOperationsEnabled \|\| isEpic}` 传给 `MultipleSelectGroup` |
+| **Gantt** | `core/components/gantt-chart/chart/main-content.tsx#L241` | `core/components/gantt-chart/chart/main-content.tsx#L98` + `core/components/issues/issue-layouts/gantt/base-gantt-root.tsx#L62` | `disabled` (main-content) + `enableSelection={isBulkOperationsEnabled && isAllowed}` (base-gantt-root) |
 
 ### 2.2 导入路径
 
@@ -73,7 +73,7 @@ import { useBulkOperationStatus } from "@/plane-web/hooks/use-bulk-operation-sta
 
 ### 3.1 四个 API 路由前缀
 
-[urls.py](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/urls.py#L17-L24) 定义了四个路由前缀：
+`apps/api/plane/urls.py` 定义了四个路由前缀：
 
 ```python
 path("api/", include("plane.app.urls"))           # 主 API（Django ViewSet）
@@ -86,7 +86,7 @@ path("api/v1/", include("plane.api.urls"))         # REST API v1（外部集成�
 
 #### `api/` — `plane.app.urls`
 
-[urls/issue.py](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/urls/issue.py) 中的批量端点（完整列表）：
+`apps/api/plane/app/urls/issue.py` 中的批量端点（完整列表）：
 
 | URL 路径 | View | 功能 | 是否涉及标签/优先级批量修改 |
 |---------|------|------|--------------------------|
@@ -96,7 +96,7 @@ path("api/v1/", include("plane.api.urls"))         # REST API v1（外部集成�
 | `issue-dates/` | IssueBulkUpdateDateEndpoint | 批量更新 Issue 日期 | ❌ 仅处理 start_date/target_date |
 
 **排除 `bulk-operation-issues/` 的理由**：
-1. [urls/issue.py](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/urls/issue.py) 完整列出了 286 行路由定义，不包含 `bulk-operation-issues` 路径
+1. `apps/api/plane/app/urls/issue.py` 完整列出了 286 行路由定义，不包含 `bulk-operation-issues` 路径
 2. `from plane.app.views import (...)` 导入列表中无任何含 `BulkOperation` 或 `bulk_operation` 的 View 类
 3. 全 `plane/app/views/` 目录 `.py` 文件搜索 `BulkOperation` 零匹配
 
@@ -104,17 +104,26 @@ path("api/v1/", include("plane.api.urls"))         # REST API v1（外部集成�
 
 #### `api/public/` — `plane.space.urls`
 
-[urls/issue.py (space)](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/space/urls/issue.py) 仅包含公开访问端点：
-- `IssueRetrievePublicEndpoint` — 单条 issue 查看
-- `IssueCommentPublicViewSet` — 评论 CRUD
-- `IssueReactionPublicViewSet` / `CommentReactionPublicViewSet` — 反应
-- `IssueVotePublicViewSet` — 投票
+`apps/api/plane/space/urls/issue.py` 包含以下端点：
 
-**排除理由**：`api/public/` 是只读的公开访问接口，URL 前缀为 `anchor/<str:anchor>/`，不支持写入操作，无批量端点。
+| URL 路径 | View | HTTP 方法 | 说明 |
+|---------|------|---------|------|
+| `anchor/<anchor>/issues/<id>/` | IssueRetrievePublicEndpoint | GET | 单条 issue 查看 |
+| `anchor/<anchor>/issues/<id>/comments/` | IssueCommentPublicViewSet | GET, POST | 评论列表与创建 |
+| `anchor/<anchor>/issues/<id>/comments/<pk>/` | IssueCommentPublicViewSet | GET, PATCH, DELETE | 评论详情/修改/删除 |
+| `anchor/<anchor>/issues/<id>/reactions/` | IssueReactionPublicViewSet | GET, POST | 反应列表与创建 |
+| `anchor/<anchor>/issues/<id>/reactions/<code>/` | IssueReactionPublicViewSet | DELETE | 删除反应 |
+| `anchor/<anchor>/comments/<id>/reactions/` | CommentReactionPublicViewSet | GET, POST | 评论反应列表与创建 |
+| `anchor/<anchor>/comments/<id>/reactions/<code>/` | CommentReactionPublicViewSet | DELETE | 删除评论反应 |
+| `anchor/<anchor>/issues/<id>/votes/` | IssueVotePublicViewSet | GET, POST, DELETE | 投票列表/创建/删除 |
+
+**修正**：`api/public/` 并非纯只读接口——IssueCommentPublicViewSet 具有 `create`、`partial_update`、`destroy` 能力，IssueReactionPublicViewSet 具有 `create`、`destroy` 能力，IssueVotePublicViewSet 具有 `create`、`destroy` 能力。
+
+**排除理由**：虽然 `api/public/` 支持 comments、reactions、votes 的写入操作，但这些是围绕 issue 的子资源（评论、反应、投票）的单条 CRUD，不是标签或优先级的批量修改端点。没有任何端点接受 `issue_ids` 列表和 `properties` 字段来批量修改 issue 属性。
 
 #### `api/instances/` — `plane.license.urls`
 
-[urls.py (license)](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/license/urls.py) 仅包含实例管理端点：
+`apps/api/plane/license/urls.py` 仅包含实例管理端点：
 - `InstanceEndpoint` / `InstanceAdminEndpoint` — 实例配置与管理员
 - `InstanceConfigurationEndpoint` — 配置项
 - `InstanceWorkSpaceEndpoint` — 工作空间可用性检查
@@ -124,14 +133,14 @@ path("api/v1/", include("plane.api.urls"))         # REST API v1（外部集成�
 
 #### `api/v1/` — `plane.api.urls`
 
-[urls/work_item.py](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/api/urls/work_item.py) 包含旧版（`issues/`）和新版（`work-items/`）端点：
+`apps/api/plane/api/urls/work_item.py` 包含旧版（`issues/`）和新版（`work-items/`）端点：
 - `IssueListCreateAPIEndpoint` — 列表/创建
 - `IssueDetailAPIEndpoint` — 详情/修改/删除
 - `IssueLinkListCreateAPIEndpoint` / `IssueCommentListCreateAPIEndpoint` — 子资源
 - `IssueActivityListAPIEndpoint` — 活动记录（只读）
 - `IssueRelationListCreateAPIEndpoint` — 关联
 
-[urls/label.py (api/v1)](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/api/urls/label.py) 仅包含：
+`apps/api/plane/api/urls/label.py` 仅包含：
 - `LabelListCreateAPIEndpoint` — 标签列表/创建
 - `LabelDetailAPIEndpoint` — 标签详情/修改/删除
 
@@ -142,17 +151,60 @@ path("api/v1/", include("plane.api.urls"))         # REST API v1（外部集成�
 | 路由前缀 | 标签批量操作端点 | 优先级批量操作端点 | 通用批量属性端点 | 排除依据 |
 |---------|---------------|-----------------|---------------|---------|
 | `api/` | ❌ 不存在 | ❌ 不存在 | ❌ `bulk-operation-issues/` 不存在 | 完整阅读 urls/issue.py 286 行，无此路由 |
-| `api/public/` | ❌ 不存在 | ❌ 不存在 | ❌ 不存在 | 公开只读接口，无写入端点 |
+| `api/public/` | ❌ 不存在 | ❌ 不存在 | ❌ 不存在 | 有 comments/reactions/votes 写入能力，但不涉及标签/优先级批量修改 |
 | `api/instances/` | ❌ 不存在 | ❌ 不存在 | ❌ 不存在 | 实例管理接口，无业务数据 |
 | `api/v1/` | ❌ 不存在 | ❌ 不存在 | ❌ 不存在 | 外部集成 API，仅单条 CRUD |
 
 ---
 
-## 四、缺失边界确认：`bulk-operation-issues` 端点不存在
+## 四、仓库中的 EE 扩展目录与批量操作的关系
 
-### 4.1 前端引用
+### 4.1 editor 相关的 EE 扩展存根
 
-前端 [IssueService.bulkOperations](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/services/issue/issue.service.ts#L339-L345) 向以下 URL 发送 POST 请求：
+`ce/` 目录中存在多个与 editor 相关的扩展存根，这些文件由 `core/` 通过 `@/plane-web/` 别名导入：
+
+| CE 存根文件 | 功能 | 批量操作相关 |
+|------------|------|------------|
+| `ce/hooks/editor/use-extended-editor-config.ts` | 编辑器扩展配置（CE 版返回空配置） | ❌ 无关 |
+| `ce/hooks/pages/use-extended-editor-extensions.ts` | 页面编辑器扩展属性（CE 版空实现） | ❌ 无关 |
+| `ce/hooks/use-additional-editor-mention.tsx` | 编辑器高级提及功能（CE 版返回空） | ❌ 无关 |
+| `ce/hooks/use-editor-flagging.ts` | 编辑器功能开关（CE 版返回默认值） | ❌ 无关 |
+| `ce/hooks/use-file-size.ts` | 文件大小限制（CE 版读实例配置） | ❌ 无关 |
+| `ce/hooks/use-issue-embed.tsx` | Issue 嵌入编辑器（CE 版渲染升级卡片） | ❌ 无关 |
+
+`ce/types/pages/pane-extensions.ts` 中有注释明确标注：
+```ts
+// CE re-exports the core navigation pane extension types directly
+// EE overrides this with specific extension data types
+```
+
+这证实了 `ce/` 是可替换层的设计意图——Plane One 付费版可以覆盖这些存根提供增强实现。但这些 editor 扩展存根与 Issue 批量操作无关。
+
+### 4.2 批量操作相关的 CE 存根
+
+与批量操作直接相关的 CE 存根只有两个：
+
+| CE 存根文件 | 功能 | Plane One 需要覆盖的内容 |
+|------------|------|------------------------|
+| `ce/hooks/use-bulk-operation-status.ts` | 返回 `false`，禁用选择 | 返回 `true`，启用选择 |
+| `ce/components/issues/bulk-operations/root.tsx` | 渲染升级横幅 | 渲染实际操作面板，调用 `bulkUpdateProperties` |
+
+### 4.3 后端 API 的替换实现
+
+前端通过 `@/plane-web/` 别名实现 `ce/` → Plane One 的替换，但后端没有类似的替换机制。`bulk-operation-issues` 端点需要由 Plane One 的后端服务独立实现。当前仓库中：
+- 无 `plane-ee/` 或类似目录
+- [settings/common.py](apps/api/plane/settings/common.py) 的 `INSTALLED_APPS` 无任何付费版 Django App
+- `plane/license/` 模块仅处理实例注册和配置，不含业务 API
+
+**结论**：Issue 批量操作的完整实现（前端操作面板 + 后端 API 端点）均不在本仓库中。
+
+---
+
+## 五、缺失边界确认：`bulk-operation-issues` 端点不存在
+
+### 5.1 前端引用
+
+前端 `core/services/issue/issue.service.ts#L339-L345` 向以下 URL 发送 POST 请求：
 
 ```ts
 async bulkOperations(workspaceSlug: string, projectId: string, data: TBulkOperationsPayload): Promise<any> {
@@ -162,7 +214,7 @@ async bulkOperations(workspaceSlug: string, projectId: string, data: TBulkOperat
 }
 ```
 
-### 4.2 后端搜索结果
+### 5.2 后端搜索结果
 
 | 搜索范围 | 搜索模式 | 结果 |
 |---------|---------|------|
@@ -171,37 +223,37 @@ async bulkOperations(workspaceSlug: string, projectId: string, data: TBulkOperat
 | `apps/api/` 全部 `.py` 文件 | `bulk_operation` | 0 匹配 |
 | 全仓库 `.py` 文件 | `bulk-operation-issues` | 0 匹配 |
 
-### 4.3 前端 Store 方法的调用者搜索
+### 5.3 前端 Store 方法的调用者搜索
 
-[bulkUpdateProperties](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L721-L753) 在 8 个 store 中被声明为接口方法或继承自 `BaseIssuesStore`：
+`core/store/issue/helpers/base-issues.store.ts#L721-L753` 中的 `bulkUpdateProperties` 在 8 个 store 中被声明为接口方法或继承自 `BaseIssuesStore`：
 
 | Store | 位置 |
 |-------|------|
-| ProjectIssueStore | [project/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/project/issue.store.ts#L52) |
-| CycleIssueStore | [cycle/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/cycle/issue.store.ts#L91) |
-| ModuleIssueStore | [module/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/module/issue.store.ts#L61) |
-| ProfileIssueStore | [profile/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/profile/issue.store.ts#L59) |
-| WorkspaceIssueStore | [workspace/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/workspace/issue.store.ts#L52) |
-| ProjectViewsIssueStore | [project-views/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/project-views/issue.store.ts#L54) |
-| WorkspaceDraftIssueStore | [workspace-draft/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/workspace-draft/issue.store.ts#L112) |
-| ArchivedIssueStore | [archived/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/archived/issue.store.ts#L41) |
+| ProjectIssueStore | `core/store/issue/project/issue.store.ts#L52` |
+| CycleIssueStore | `core/store/issue/cycle/issue.store.ts#L91` |
+| ModuleIssueStore | `core/store/issue/module/issue.store.ts#L61` |
+| ProfileIssueStore | `core/store/issue/profile/issue.store.ts#L59` |
+| WorkspaceIssueStore | `core/store/issue/workspace/issue.store.ts#L52` |
+| ProjectViewsIssueStore | `core/store/issue/project-views/issue.store.ts#L54` |
+| WorkspaceDraftIssueStore | `core/store/issue/workspace-draft/issue.store.ts#L112` |
+| ArchivedIssueStore | `core/store/issue/archived/issue.store.ts#L41` |
 
 **全仓库搜索 `.bulkUpdateProperties(` 的调用者结果为零**——该方法已实现但无组件调用。
 
-### 4.4 社区版前端行为
+### 5.4 社区版前端行为
 
-- [useBulkOperationStatus](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/ce/hooks/use-bulk-operation-status.ts) 始终返回 `false`
-- [IssueBulkOperationsRoot (CE)](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/ce/components/issues/bulk-operations/root.tsx) 仅渲染 [BulkOperationsUpgradeBanner](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/bulk-operations/upgrade-banner.tsx)，展示"Upgrade to One"按钮
+- `ce/hooks/use-bulk-operation-status.ts` 始终返回 `false`
+- `ce/components/issues/bulk-operations/root.tsx` 仅渲染 `core/components/issues/bulk-operations/upgrade-banner.tsx`，展示"Upgrade to One"按钮
 
 ---
 
-## 五、前端：已有的批量编辑代码结构
+## 六、前端：已有的批量编辑代码结构
 
 虽然后端端点不存在，但前端已实现了选择、组装请求和本地状态更新的代码。
 
-### 5.1 Issue 集合选择 — MultipleSelectStore
+### 6.1 Issue 集合选择 — MultipleSelectStore
 
-[MultipleSelectStore](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/multiple_select.store.ts) 管理选择状态：
+`core/store/multiple_select.store.ts` 管理选择状态：
 
 ```ts
 selectedEntityDetails: TEntityDetails[] = [];    // 选中实体列表
@@ -216,16 +268,16 @@ activeEntityDetails: TEntityDetails | null;       // 当前活跃项
 
 `selectedEntityIds` 是 computed 属性，映射出 ID 列表。
 
-### 5.2 选择交互 — useMultipleSelect
+### 6.2 选择交互 — useMultipleSelect
 
-[useMultipleSelect](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/hooks/use-multiple-select.ts) 封装键盘/鼠标交互：
+`core/hooks/use-multiple-select.ts` 封装键盘/鼠标交互：
 - **Shift + 点击**：范围选择
 - **Shift + 方向键**：逐个扩展
 - **组头复选框**：`isGroupSelected()` 返回 `"empty"` | `"partial"` | `"complete"`
 
-### 5.3 选择容器 — MultipleSelectGroup
+### 6.3 选择容器 — MultipleSelectGroup
 
-[MultipleSelectGroup](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/core/multiple-select/select-group.tsx) 接收 `entities: { [groupID]: string[] }` 和 `disabled`：
+`core/components/core/multiple-select/select-group.tsx` 接收 `entities: { [groupID]: string[] }` 和 `disabled`：
 
 ```tsx
 <MultipleSelectGroup
@@ -241,9 +293,9 @@ activeEntityDetails: TEntityDetails | null;       // 当前活跃项
 </MultipleSelectGroup>
 ```
 
-### 5.4 批量操作载荷类型
+### 6.4 批量操作载荷类型
 
-[TBulkOperationsPayload](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/packages/types/src/issues/issues/issue.ts#L153-L156)：
+`packages/types/src/issues/issues/issue.ts#L153-L156`：
 
 ```ts
 type TBulkOperationsPayload = {
@@ -254,9 +306,9 @@ type TBulkOperationsPayload = {
 
 `TBulkIssueProperties` 包含 `state_id`、`priority`、`label_ids`、`assignee_ids`、`start_date`、`target_date`、`module_ids`、`cycle_id`、`estimate_point`。
 
-### 5.5 Store 层 — bulkUpdateProperties 实现
+### 6.5 Store 层 — bulkUpdateProperties 实现
 
-[bulkUpdateProperties](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L721-L753)（完整代码）：
+`core/store/issue/helpers/base-issues.store.ts#L721-L753`（完整代码）：
 
 ```ts
 bulkUpdateProperties = async (workspaceSlug: string, projectId: string, data: TBulkOperationsPayload) => {
@@ -290,11 +342,11 @@ bulkUpdateProperties = async (workspaceSlug: string, projectId: string, data: TB
 
 **标签语义差异**：
 - **前端 store 更新 `label_ids`**：追加语义 `uniq([...existing, ...new])`
-- **后端单条更新 `label_ids`**（见第六节）：替换语义，先 `IssueLabel.objects.filter(issue=instance).delete()` 再 `bulk_create`
+- **后端单条更新 `label_ids`**（见第七节）：替换语义，先 `IssueLabel.objects.filter(issue=instance).delete()` 再 `bulk_create`
 
-### 5.6 MobX 本地更新机制
+### 6.6 MobX 本地更新机制
 
-[IssueStore.updateIssue](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/issue.store.ts#L108-L116)：
+`core/store/issue/issue.store.ts#L108-L116`：
 
 ```ts
 updateIssue = (issueId: string, issue: Partial<TIssue>) => {
@@ -312,26 +364,26 @@ updateIssue = (issueId: string, issue: Partial<TIssue>) => {
 
 ---
 
-## 六、服务端：单条更新路径的直接证据链
+## 七、服务端：单条更新路径的直接证据链
 
-由于 `bulk-operation-issues` 端点不存在，以下以 [IssueViewSet.partial_update](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L615-L702) 为参照，逐一追踪权限、Schema、DB 写入、通知、事务和并发处理的实际代码。**这些是单条更新的证据，不是批量操作的实现**。
+由于 `bulk-operation-issues` 端点不存在，以下以 `apps/api/plane/app/views/issue/base.py#L615-L702` 中的 `IssueViewSet.partial_update` 为参照，逐一追踪权限、Schema、DB 写入、通知、事务和并发处理的实际代码。**这些是单条更新的证据，不是批量操作的实现**。
 
-### 6.1 权限验证
+### 7.1 权限验证
 
 ```python
 @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER], creator=True, model=Issue)
 def partial_update(self, request, slug, project_id, pk=None):
 ```
 
-[allow_permission](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/permissions/base.py#L19-L87) 执行流程：
+`apps/api/plane/app/permissions/base.py#L19-L87` 的 `allow_permission` 执行流程：
 
 1. **creator 检查**（第 24-38 行）：如果 `creator=True`，先查 `WorkspaceMember` 确认用户是 workspace 成员，再查 `model.objects.filter(id=kwargs["pk"], created_by=request.user)` 验证是否为创建者
 2. **角色检查**（第 44-78 行）：查 `ProjectMember` 验证用户在项目中角色 ≥ `allowed_roles`；若用户不是项目成员但有 workspace ADMIN 角色，也允许
 3. 失败返回 `403 {"error": "You don't have the required permissions."}`
 
-### 6.2 数据获取与快照
+### 7.2 数据获取与快照
 
-[partial_update](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L623-L665) 用 `ArrayAgg` 注解获取 `label_ids`、`assignee_ids`、`module_ids` 的当前值，用于活动记录对比：
+`partial_update` 用 `ArrayAgg` 注解获取 `label_ids`、`assignee_ids`、`module_ids` 的当前值，用于活动记录对比：
 
 ```python
 issue = (
@@ -348,9 +400,9 @@ issue = (
 current_instance = json.dumps(IssueDetailSerializer(issue).data, cls=DjangoJSONEncoder)
 ```
 
-### 6.3 Schema 验证 — IssueCreateSerializer.validate()
+### 7.3 Schema 验证 — IssueCreateSerializer.validate()
 
-[IssueCreateSerializer.validate()](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/serializers/issue.py#L123-L196)：
+`apps/api/plane/app/serializers/issue.py#L123-L196`：
 
 **标签验证**（第 158-165 行）：
 ```python
@@ -367,14 +419,14 @@ if attrs.get("label_ids"):
 - `label_ids` 字段定义（第 90-94 行）为 `ListField(child=PrimaryKeyRelatedField(queryset=Label.objects.all()))`，DRF 先验证每个 ID 是否存在于 `Label` 表
 
 **优先级验证**：
-- `priority` 是 [Issue 模型](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/db/models/issue.py#L141-L146) 的 `CharField(max_length=30, choices=PRIORITY_CHOICES)`
+- `priority` 是 `apps/api/plane/db/models/issue.py#L141-L146` 的 `CharField(max_length=30, choices=PRIORITY_CHOICES)`
 - `PRIORITY_CHOICES`（第 107-113 行）：`("urgent","Urgent"), ("high","High"), ("medium","Medium"), ("low","Low"), ("none","None")`
 - Serializer 的 `fields = "__all__"` 包含 `priority`，DRF 自动验证 choices 约束
 - 非法值返回 `400 BadRequest`
 
-### 6.4 数据库写入 — IssueCreateSerializer.update()
+### 7.4 数据库写入 — IssueCreateSerializer.update()
 
-[IssueCreateSerializer.update()](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/serializers/issue.py#L275-L329)：
+`apps/api/plane/app/serializers/issue.py#L275-L329`：
 
 **标签写入**（第 306-325 行）：
 ```python
@@ -397,9 +449,9 @@ if labels is not None:
 - ⚠️ 标签的"先删后建"不在事务中 — 如果 `bulk_create` 失败（且 `IntegrityError` 未被捕获），issue 的标签已被删除但新标签未创建
 - `ignore_conflicts=True` 可避免重复插入，但也会静默跳过某些行
 
-### 6.5 活动记录 — Celery 异步任务
+### 7.5 活动记录 — Celery 异步任务
 
-[partial_update](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L675-L685) 在 `serializer.save()` 成功后触发：
+`partial_update` 在 `serializer.save()` 成功后触发：
 
 ```python
 issue_activity.delay(
@@ -414,20 +466,20 @@ issue_activity.delay(
 )
 ```
 
-[issue_activity](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L1504-L1604) 的执行流程：
+`apps/api/plane/bgtasks/issue_activities_task.py#L1504-L1604` 的执行流程：
 
 1. 根据 `type="issue.activity.updated"` 映射到 `update_issue_activity`（第 594 行）
 2. `update_issue_activity` 的 `ISSUE_ACTIVITY_MAPPER`（第 604-622 行）包含：
-   - `"priority"` → [track_priority](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L161-L185)
-   - `"label_ids"` → [track_labels](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L290-L353)
+   - `"priority"` → `issue_activities_task.py#L161-L185` 的 `track_priority`
+   - `"label_ids"` → `issue_activities_task.py#L290-L353` 的 `track_labels`
 3. `IssueActivity.objects.bulk_create(issue_activities)` 写入活动记录
 4. 如果 `notification=True`，触发 `notifications.delay()`
 
 活动记录与主数据不在同一事务中——`serializer.save()` 同步完成后，`issue_activity.delay()` 是异步的。
 
-### 6.6 通知订阅者
+### 7.6 通知订阅者
 
-[notifications](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/notification_task.py#L191-L319)：
+`apps/api/plane/bgtasks/notification_task.py#L191-L319`：
 
 1. 获取 `IssueSubscriber` 列表，排除操作者和新提及用户
 2. 对每个订阅者查 `UserNotificationPreference`
@@ -435,7 +487,7 @@ issue_activity.delay(
 
 通知是二级异步任务（`notifications.delay()` 由 `issue_activity` 内部触发），失败不影响主数据或活动记录。
 
-### 6.7 并发冲突处理
+### 7.7 并发冲突处理
 
 **后端**：
 - ❌ 没有 `select_for_update()` 行级锁
@@ -448,13 +500,13 @@ issue_activity.delay(
 
 ---
 
-## 七、已有批量端点的实现模式（参照分析）
+## 八、已有批量端点的实现模式（参照分析）
 
 仓库中存在四个批量端点，以下是它们的实际代码特征。
 
-### 7.1 BulkDeleteIssuesEndpoint
+### 8.1 BulkDeleteIssuesEndpoint
 
-[BulkDeleteIssuesEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L761-L785)：
+`apps/api/plane/app/views/issue/base.py#L761-L785`：
 
 ```python
 class BulkDeleteIssuesEndpoint(BaseAPIView):
@@ -473,30 +525,30 @@ class BulkDeleteIssuesEndpoint(BaseAPIView):
 - ❌ 无逐条权限验证
 - 删除前先清理关联表，若中间失败，关联已删除而 issue 未删除
 
-### 7.2 BulkArchiveIssuesEndpoint
+### 8.2 BulkArchiveIssuesEndpoint
 
-[BulkArchiveIssuesEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/archive.py#L305-L342)：
+`apps/api/plane/app/views/issue/archive.py#L305-L342`：
 
 - ❌ 无 `transaction.atomic()`
 - ⚠️ 全量失败语义：任一 issue 状态不合法整批 400，但 `issue_activity.delay()` 已对前面 issue 触发
 - ✅ 逐条触发活动记录
 
-### 7.3 BulkCreateIssueLabelsEndpoint
+### 8.3 BulkCreateIssueLabelsEndpoint
 
-[BulkCreateIssueLabelsEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/label.py#L90-L117)：
+`apps/api/plane/app/views/issue/label.py#L90-L117`：
 
 此端点批量创建 **Label 实体本身**，不是给 Issue 分配标签。
 
-### 7.4 IssueBulkUpdateDateEndpoint
+### 8.4 IssueBulkUpdateDateEndpoint
 
-[IssueBulkUpdateDateEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L1114-L1171)：
+`apps/api/plane/app/views/issue/base.py#L1114-L1171`：
 
 - ❌ 无 `transaction.atomic()`
 - ⚠️ 逐条跳过不存在的 issue，前端无法感知
 - ⚠️ `issue_activity.delay()` 在 `bulk_update()` 之前调用
 - ❌ 无并发冲突处理
 
-### 7.5 参照模式汇总
+### 8.5 参照模式汇总
 
 | 端点 | 事务 | 部分成功 | 活动记录 | 并发处理 |
 |------|------|---------|---------|---------|
@@ -509,11 +561,11 @@ class BulkDeleteIssuesEndpoint(BaseAPIView):
 
 ---
 
-## 八、前端：三种更新策略对比
+## 九、前端：三种更新策略对比
 
-### 8.1 单条 issueUpdate — 乐观更新 + try-catch 回滚
+### 9.1 单条 issueUpdate — 乐观更新 + try-catch 回滚
 
-[issueUpdate](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L554-L588)：
+`core/store/issue/helpers/base-issues.store.ts#L554-L588`：
 
 ```ts
 async issueUpdate(workspaceSlug, projectId, issueId, data, shouldSync = true) {
@@ -531,9 +583,9 @@ async issueUpdate(workspaceSlug, projectId, issueId, data, shouldSync = true) {
 }
 ```
 
-### 8.2 批量 bulkUpdateProperties — 先请求后更新
+### 9.2 批量 bulkUpdateProperties — 先请求后更新
 
-[bulkUpdateProperties](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L721-L753)：
+`core/store/issue/helpers/base-issues.store.ts#L721-L753`：
 
 ```ts
 bulkUpdateProperties = async (workspaceSlug, projectId, data) => {
@@ -554,9 +606,9 @@ bulkUpdateProperties = async (workspaceSlug, projectId, data) => {
 2. `throw new Error("Work item not found")` 在 `forEach` 内抛出，会中断后续 issue 的本地更新
 3. 如果后端部分成功，前端无法区分
 
-### 8.3 日期 updateIssueDates — 乐观更新 + 手动快照回滚
+### 9.3 日期 updateIssueDates — 乐观更新 + 手动快照回滚
 
-[updateIssueDates](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L755-L798)：
+`core/store/issue/helpers/base-issues.store.ts#L755-L798`：
 
 ```ts
 async updateIssueDates(workspaceSlug, updates, projectId) {
@@ -580,7 +632,7 @@ async updateIssueDates(workspaceSlug, updates, projectId) {
 }
 ```
 
-### 8.4 对比表
+### 9.4 对比表
 
 | 方法 | 更新时机 | 回滚机制 | API 端点存在 |
 |------|---------|---------|------------|
@@ -590,66 +642,66 @@ async updateIssueDates(workspaceSlug, updates, projectId) {
 
 ---
 
-## 九、直接证据链汇总
+## 十、直接证据链汇总
 
-### 9.1 权限
+### 10.1 权限
 
 | 环节 | 证据 | 位置 |
 |------|------|------|
 | 批量操作端点权限 | ❌ 端点不存在 | — |
-| 单条更新权限 | ✅ `@allow_permission([ADMIN, MEMBER], creator=True, model=Issue)` | [base.py#L615](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L615) |
-| 权限装饰器实现 | ✅ 查 WorkspaceMember + ProjectMember + creator 检查 | [base.py#L19-L87](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/permissions/base.py#L19-L87) |
-| 已有批量端点权限 | ✅ BulkDelete: ADMIN; BulkArchive: ADMIN+MEMBER; BulkUpdateDate: ADMIN+MEMBER | [base.py#L762](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L762), [archive.py#L308](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/archive.py#L308), [base.py#L1114](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L1114) |
+| 单条更新权限 | ✅ `@allow_permission([ADMIN, MEMBER], creator=True, model=Issue)` | `app/views/issue/base.py#L615` |
+| 权限装饰器实现 | ✅ 查 WorkspaceMember + ProjectMember + creator 检查 | `app/permissions/base.py#L19-L87` |
+| 已有批量端点权限 | ✅ BulkDelete: ADMIN; BulkArchive: ADMIN+MEMBER; BulkUpdateDate: ADMIN+MEMBER | `app/views/issue/base.py#L762`, `app/views/issue/archive.py#L308`, `app/views/issue/base.py#L1114` |
 
-### 9.2 Schema 验证
+### 10.2 Schema 验证
 
 | 环节 | 证据 | 位置 |
 |------|------|------|
 | 批量操作 Schema | ❌ 端点不存在 | — |
-| 标签验证 | ✅ 静默过滤非项目标签 | [issue.py#L158-L165](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/serializers/issue.py#L158-L165) |
-| 优先级验证 | ✅ DRF choices 约束 | [models/issue.py#L107-L113](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/db/models/issue.py#L107-L113) |
+| 标签验证 | ✅ 静默过滤非项目标签 | `app/serializers/issue.py#L158-L165` |
+| 优先级验证 | ✅ DRF choices 约束 | `db/models/issue.py#L107-L113` |
 
-### 9.3 数据库写入
+### 10.3 数据库写入
 
 | 环节 | 证据 | 位置 |
 |------|------|------|
 | 批量操作 DB 写入 | ❌ 端点不存在 | — |
-| 标签替换写入 | ✅ `delete()` + `bulk_create(batch_size=10, ignore_conflicts=True)` | [issue.py#L306-L325](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/serializers/issue.py#L306-L325) |
-| IntegrityError 静默 | ✅ `except IntegrityError: pass` | [issue.py#L323-L324](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/serializers/issue.py#L323-L324) |
-| 优先级写入 | ✅ 标量字段，`super().update()` 一行 SQL | [issue.py#L327-L329](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/serializers/issue.py#L327-L329) |
-| 已有批量写入 | ✅ `Issue.objects.bulk_update(issues, ["start_date","target_date"])` | [base.py#L1169](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L1169) |
+| 标签替换写入 | ✅ `delete()` + `bulk_create(batch_size=10, ignore_conflicts=True)` | `app/serializers/issue.py#L306-L325` |
+| IntegrityError 静默 | ✅ `except IntegrityError: pass` | `app/serializers/issue.py#L323-L324` |
+| 优先级写入 | ✅ 标量字段，`super().update()` 一行 SQL | `app/serializers/issue.py#L327-L329` |
+| 已有批量写入 | ✅ `Issue.objects.bulk_update(issues, ["start_date","target_date"])` | `app/views/issue/base.py#L1169` |
 
-### 9.4 通知订阅
+### 10.4 通知订阅
 
 | 环节 | 证据 | 位置 |
 |------|------|------|
 | 批量操作通知 | ❌ 端点不存在 | — |
-| 活动记录触发 | ✅ `issue_activity.delay(notification=True)` | [base.py#L675-L685](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L675-L685) |
-| priority 活动追踪 | ✅ `track_priority` 对比新旧值 | [issue_activities_task.py#L161-L185](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L161-L185) |
-| label_ids 活动追踪 | ✅ `track_labels` 计算集合差 | [issue_activities_task.py#L290-L353](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L290-L353) |
-| 通知推送 | ✅ `notifications.delay()` 查订阅者+偏好 | [notification_task.py#L191-L319](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/notification_task.py#L191-L319) |
-| 活动与数据不同事务 | ✅ Celery 异步，独立事务 | [issue_activities_task.py#L1584-L1599](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L1584-L1599) |
+| 活动记录触发 | ✅ `issue_activity.delay(notification=True)` | `app/views/issue/base.py#L675-L685` |
+| priority 活动追踪 | ✅ `track_priority` 对比新旧值 | `bgtasks/issue_activities_task.py#L161-L185` |
+| label_ids 活动追踪 | ✅ `track_labels` 计算集合差 | `bgtasks/issue_activities_task.py#L290-L353` |
+| 通知推送 | ✅ `notifications.delay()` 查订阅者+偏好 | `bgtasks/notification_task.py#L191-L319` |
+| 活动与数据不同事务 | ✅ Celery 异步，独立事务 | `bgtasks/issue_activities_task.py#L1584-L1599` |
 
-### 9.5 事务回滚
+### 10.5 事务回滚
 
 | 环节 | 证据 | 位置 |
 |------|------|------|
 | 批量操作事务 | ❌ 端点不存在 | — |
 | 单条更新事务 | ❌ `transaction`/`atomic` 在 views/issue/ 和 serializers/issue.py 中零匹配 | — |
-| 标签先删后建 | ⚠️ 不在事务中，delete 后 bulk_create 失败会导致标签丢失 | [issue.py#L306-L325](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/serializers/issue.py#L306-L325) |
+| 标签先删后建 | ⚠️ 不在事务中，delete 后 bulk_create 失败会导致标签丢失 | `app/serializers/issue.py#L306-L325` |
 | 已有批量端点事务 | ❌ BulkDelete/BulkArchive/BulkUpdateDate 均无 `transaction.atomic()` | — |
 
-### 9.6 部分成功
+### 10.6 部分成功
 
 | 环节 | 证据 | 位置 |
 |------|------|------|
 | 批量操作部分成功 | ❌ 端点不存在 | — |
-| BulkUpdateDate 静默跳过 | ✅ `if not issue: continue` | [base.py#L1130-L1131](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L1130-L1131) |
-| BulkArchive 全量失败 | ⚠️ 但活动记录已触发 | [archive.py#L320-L327](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/archive.py#L320-L327) |
-| 标签验证静默过滤 | ✅ 不属于项目的标签被静默丢弃 | [issue.py#L158-L165](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/serializers/issue.py#L158-L165) |
-| 前端 forEach 中 throw | ⚠️ `throw new Error("Work item not found")` 中断后续更新 | [base-issues.store.ts#L729](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L729) |
+| BulkUpdateDate 静默跳过 | ✅ `if not issue: continue` | `app/views/issue/base.py#L1130-L1131` |
+| BulkArchive 全量失败 | ⚠️ 但活动记录已触发 | `app/views/issue/archive.py#L320-L327` |
+| 标签验证静默过滤 | ✅ 不属于项目的标签被静默丢弃 | `app/serializers/issue.py#L158-L165` |
+| 前端 forEach 中 throw | ⚠️ `throw new Error("Work item not found")` 中断后续更新 | `core/store/issue/helpers/base-issues.store.ts#L729` |
 
-### 9.7 并发冲突
+### 10.7 并发冲突
 
 | 环节 | 证据 | 位置 |
 |------|------|------|
@@ -660,17 +712,17 @@ async updateIssueDates(workspaceSlug, updates, projectId) {
 
 ---
 
-## 十、结论
+## 十一、结论
 
-### 10.1 当前状态
+### 11.1 当前状态
 
 批量修改 Issue 标签和优先级的完整功能在本仓库中不可用：
 
 1. **后端 API 不存在**：四个 API 路由前缀（`api/`、`api/public/`、`api/instances/`、`api/v1/`）均无 `bulk-operation-issues` 或等效端点
 2. **前端代码是预留骨架**：`bulkUpdateProperties` 方法已实现但无组件调用；三个布局（List、Gantt、Spreadsheet）通过 `@/plane-web/` 别名导入 `useBulkOperationStatus`，当前 `ce/` 实现返回 `false`，禁用选择功能
-3. **Plane One 的实现不在本仓库中**：`ce/` 是社区版可替换层，Plane One 付费版通过替换 `ce/` 目录提供增强的 `useBulkOperationStatus`（返回 `true`）和 `IssueBulkOperationsRoot`（实际操作面板），但替换实现不在本仓库中
+3. **Plane One 的实现不在本仓库中**：`ce/` 是社区版可替换层，Plane One 付费版通过替换 `ce/` 目录提供增强的 `useBulkOperationStatus`（返回 `true`）和 `IssueBulkOperationsRoot`（实际操作面板），后端 API 端点也需要独立实现，但替换实现均不在本仓库中
 
-### 10.2 基于现有代码的观察
+### 11.2 基于现有代码的观察
 
 基于单条更新路径和已有批量端点的实际代码：
 
@@ -683,41 +735,47 @@ async updateIssueDates(workspaceSlug, updates, projectId) {
 
 ---
 
-## 十一、代码索引
+## 十二、代码索引
 
 | 组件 | 文件路径 |
 |------|---------|
-| tsconfig 路径别名 | [tsconfig.json](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/tsconfig.json#L4-L11) |
-| CE 批量操作开关 | [use-bulk-operation-status.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/ce/hooks/use-bulk-operation-status.ts) |
-| CE 批量操作根组件 | [root.tsx (CE)](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/ce/components/issues/bulk-operations/root.tsx) |
-| 升级提示横幅 | [upgrade-banner.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/bulk-operations/upgrade-banner.tsx) |
-| Spreadsheet 布局 | [spreadsheet-view.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/issue-layouts/spreadsheet/spreadsheet-view.tsx#L68) |
-| List 布局 | [default.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/issue-layouts/list/default.tsx#L86) |
-| Gantt 布局 (main-content) | [main-content.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/gantt-chart/chart/main-content.tsx#L98) |
-| Gantt 布局 (base-root) | [base-gantt-root.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/components/issues/issue-layouts/gantt/base-gantt-root.tsx#L62) |
-| 前端批量操作服务 | [issue.service.ts#L339-L345](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/services/issue/issue.service.ts#L339-L345) |
-| 前端批量 Store 方法 | [base-issues.store.ts#L721-L753](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L721-L753) |
-| 前端 Store 更新方法 | [issue.store.ts#L108-L116](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/issue/issue.store.ts#L108-L116) |
-| 批量操作载荷类型 | [issue.ts#L153-L156](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/packages/types/src/issues/issues/issue.ts#L153-L156) |
-| 选择状态管理 | [multiple_select.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/web/core/store/multiple_select.store.ts) |
-| 根 URL 配置 | [urls.py](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/urls.py#L17-L24) |
-| api/ 路由汇总 | [urls/__init__.py](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/urls/__init__.py) |
-| api/ Issue 路由 | [urls/issue.py](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/urls/issue.py) |
-| api/public/ Issue 路由 | [urls/issue.py (space)](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/space/urls/issue.py) |
-| api/instances/ 路由 | [urls.py (license)](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/license/urls.py) |
-| api/v1/ 路由汇总 | [urls/__init__.py (api)](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/api/urls/__init__.py) |
-| api/v1/ Work Item 路由 | [urls/work_item.py](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/api/urls/work_item.py) |
-| api/v1/ Label 路由 | [urls/label.py](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/api/urls/label.py) |
-| 单条更新视图 | [base.py#L615-L702](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L615-L702) |
-| 权限装饰器 | [base.py#L19-L87](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/permissions/base.py#L19-L87) |
-| Issue Serializer | [issue.py#L82-L329](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/serializers/issue.py#L82-L329) |
-| Issue 模型（priority choices） | [models/issue.py#L107-L113](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/db/models/issue.py#L107-L113) |
-| BulkDeleteIssues | [base.py#L761-L785](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L761-L785) |
-| BulkArchiveIssues | [archive.py#L305-L342](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/archive.py#L305-L342) |
-| BulkCreateIssueLabels | [label.py#L90-L117](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/label.py#L90-L117) |
-| IssueBulkUpdateDate | [base.py#L1114-L1171](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/app/views/issue/base.py#L1114-L1171) |
-| 活动记录任务 | [issue_activities_task.py#L1504-L1604](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L1504-L1604) |
-| priority 活动追踪 | [issue_activities_task.py#L161-L185](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L161-L185) |
-| labels 活动追踪 | [issue_activities_task.py#L290-L353](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L290-L353) |
-| 活动映射表 | [issue_activities_task.py#L604-L622](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/issue_activities_task.py#L604-L622) |
-| 通知任务 | [notification_task.py#L191-L319](file:///d:/fz/0508-3/solo-dogfeeding/code/195-plane/apps/api/plane/bgtasks/notification_task.py#L191-L319) |
+| tsconfig 路径别名 | `apps/web/tsconfig.json` |
+| CE 批量操作开关 | `apps/web/ce/hooks/use-bulk-operation-status.ts` |
+| CE 批量操作根组件 | `apps/web/ce/components/issues/bulk-operations/root.tsx` |
+| 升级提示横幅 | `apps/web/core/components/issues/bulk-operations/upgrade-banner.tsx` |
+| CE editor 扩展配置存根 | `apps/web/ce/hooks/editor/use-extended-editor-config.ts` |
+| CE editor 附加提及存根 | `apps/web/ce/hooks/use-additional-editor-mention.tsx` |
+| CE editor flag 存根 | `apps/web/ce/hooks/use-editor-flagging.ts` |
+| CE page 扩展编辑器存根 | `apps/web/ce/hooks/pages/use-extended-editor-extensions.ts` |
+| CE pane 扩展类型 | `apps/web/ce/types/pages/pane-extensions.ts` |
+| Spreadsheet 布局 | `apps/web/core/components/issues/issue-layouts/spreadsheet/spreadsheet-view.tsx#L68` |
+| List 布局 | `apps/web/core/components/issues/issue-layouts/list/default.tsx#L86` |
+| Gantt 布局 (main-content) | `apps/web/core/components/gantt-chart/chart/main-content.tsx#L98` |
+| Gantt 布局 (base-root) | `apps/web/core/components/issues/issue-layouts/gantt/base-gantt-root.tsx#L62` |
+| 前端批量操作服务 | `apps/web/core/services/issue/issue.service.ts#L339-L345` |
+| 前端批量 Store 方法 | `apps/web/core/store/issue/helpers/base-issues.store.ts#L721-L753` |
+| 前端 Store 更新方法 | `apps/web/core/store/issue/issue.store.ts#L108-L116` |
+| 批量操作载荷类型 | `packages/types/src/issues/issues/issue.ts#L153-L156` |
+| 选择状态管理 | `apps/web/core/store/multiple_select.store.ts` |
+| 根 URL 配置 | `apps/api/plane/urls.py` |
+| api/ 路由汇总 | `apps/api/plane/app/urls/__init__.py` |
+| api/ Issue 路由 | `apps/api/plane/app/urls/issue.py` |
+| api/public/ Issue 路由 | `apps/api/plane/space/urls/issue.py` |
+| api/instances/ 路由 | `apps/api/plane/license/urls.py` |
+| api/v1/ 路由汇总 | `apps/api/plane/api/urls/__init__.py` |
+| api/v1/ Work Item 路由 | `apps/api/plane/api/urls/work_item.py` |
+| api/v1/ Label 路由 | `apps/api/plane/api/urls/label.py` |
+| 单条更新视图 | `apps/api/plane/app/views/issue/base.py#L615-L702` |
+| 权限装饰器 | `apps/api/plane/app/permissions/base.py#L19-L87` |
+| Issue Serializer | `apps/api/plane/app/serializers/issue.py#L82-L329` |
+| Issue 模型（priority choices） | `apps/api/plane/db/models/issue.py#L107-L113` |
+| BulkDeleteIssues | `apps/api/plane/app/views/issue/base.py#L761-L785` |
+| BulkArchiveIssues | `apps/api/plane/app/views/issue/archive.py#L305-L342` |
+| BulkCreateIssueLabels | `apps/api/plane/app/views/issue/label.py#L90-L117` |
+| IssueBulkUpdateDate | `apps/api/plane/app/views/issue/base.py#L1114-L1171` |
+| 活动记录任务 | `apps/api/plane/bgtasks/issue_activities_task.py#L1504-L1604` |
+| priority 活动追踪 | `apps/api/plane/bgtasks/issue_activities_task.py#L161-L185` |
+| labels 活动追踪 | `apps/api/plane/bgtasks/issue_activities_task.py#L290-L353` |
+| 活动映射表 | `apps/api/plane/bgtasks/issue_activities_task.py#L604-L622` |
+| 通知任务 | `apps/api/plane/bgtasks/notification_task.py#L191-L319` |
+| Django INSTALLED_APPS | `apps/api/plane/settings/common.py` |
