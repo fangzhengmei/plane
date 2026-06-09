@@ -438,10 +438,416 @@ api 层已使用 `drf-spectacular` 生成 OpenAPI schema，可通过 CI 流程�
 | 前端 TBaseIssue | [packages/types/src/issues/issue.ts#L45](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue.ts#L45-L80) |
 | 前端 TIssue | [packages/types/src/issues/issue.ts#L90](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue.ts#L90-L104) |
 | 前端 IUserLite | [packages/types/src/users.ts#L25](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/users.ts#L25-L34) |
+| **前端 addIssueToStore** | [store/issue/issue-details/issue.store.ts#L142](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/issue-details/issue.store.ts#L142-L179) |
+| **前端 ISSUE_ORDERBY_KEY** | [store/issue/helpers/base-issues.store.ts#L145](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L145-L175) |
+| **前端 ISSUE_GROUP_BY_KEY** | [store/issue/helpers/base-issues.store.ts#L116](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L116-L128) |
+| **前端 getFilterParams expand 逻辑** | [store/issue/helpers/issue-filter-helper.store.ts#L92](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/helpers/issue-filter-helper.store.ts#L92-L126) |
+| **前端 IssueService getIssuesFromServer 路由** | [services/issue/issue.service.ts#L40](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/issue/issue.service.ts#L40-L61) |
 
 ---
 
-## 十、关键文件索引
+## 十一、前端 SDK 与服务层承接路径
+
+### 11.1 服务层总览
+
+前端 Issue 数据流经三层代码：
+
+```
+组件/hooks
+   ↓ 调用
+Store 层 (MobX)               ← 状态管理、查询参数组装
+   ↓ 委托
+Service 层 (IssueService)     ← HTTP 请求、URL 路由
+   ↓ axios
+后端 API
+```
+
+核心服务类为 [IssueService](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/issue/issue.service.ts)，继承自 [APIService](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/services/src/api.service.ts)（axios 封装）。
+
+### 11.2 EIssueServiceType — 服务类型路由
+
+定义在 [packages/types/src/issues/issue.ts#L23-L27](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue.ts#L23-L27)：
+
+```typescript
+export enum EIssueServiceType {
+  ISSUES = "issues",
+  EPICS = "epics",
+  WORK_ITEMS = "work-items",
+}
+```
+
+`IssueService` 构造时接收 `serviceType`，拼接为 URL 路径段：
+
+```typescript
+constructor(serviceType: TIssueServiceType = EIssueServiceType.ISSUES) {
+    this.serviceType = serviceType;
+}
+// 列表请求 → /api/workspaces/{slug}/projects/{id}/${this.serviceType}/
+// 详情请求 → /api/workspaces/{slug}/projects/{id}/${this.serviceType}/{issueId}/
+```
+
+**serviceType 到后端 URL 的映射**：
+
+| serviceType | 列表 URL 后缀 | 详情 URL 后缀 |
+|------------|--------------|-------------|
+| `issues` | `/issues/` | `/issues/{id}/` |
+| `epics` | `/epics/` | `/epics/{id}/` |
+| `work-items` | `/work-items/` | `/work-items/{id}/` |
+
+### 11.3 列表请求的两条路径
+
+[IssueService.getIssuesFromServer](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/issue/issue.service.ts#L40-L61) 根据 `expand` 参数动态选择端点：
+
+```typescript
+async getIssuesFromServer(workspaceSlug, projectId, queries?, config = {}) {
+    const path =
+      (queries.expand as string)?.includes("issue_relation") && !queries.group_by
+        ? `/api/workspaces/${workspaceSlug}/projects/${projectId}/${this.serviceType}-detail/`
+        : `/api/workspaces/${workspaceSlug}/projects/${projectId}/${this.serviceType}/`;
+    return this.get(path, { params: queries }, config);
+}
+```
+
+**关键逻辑**：当 `expand` 包含 `issue_relation` 且无 `group_by` 时，路由到 `-detail/` 端点（[IssueDetailEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/views/issue/base.py#L963)），该端点使用 `IssueListDetailSerializer`；否则路由到普通列表端点，使用 `.values()` 或 `IssueSerializer`。
+
+同样，[WorkspaceService.getViewIssues](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/workspace.service.ts#L272-L275) 有相同逻辑：
+
+```typescript
+async getViewIssues(workspaceSlug, params, config = {}) {
+    const path = params.expand?.includes("issue_relation")
+      ? `/api/workspaces/${workspaceSlug}/issues-detail/`
+      : `/api/workspaces/${workspaceSlug}/issues/`;
+    ...
+}
+```
+
+### 11.4 详情请求的 expand 参数
+
+[IssueStore.fetchIssue](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/issue-details/issue.store.ts#L87-L140) 固定传入：
+
+```typescript
+fetchIssue = async (workspaceSlug, projectId, issueId) => {
+    const query = {
+      expand: "issue_reactions,issue_attachments,issue_link,parent",
+    };
+    const issue = await this.issueService.retrieve(workspaceSlug, projectId, issueId, query);
+    ...
+};
+```
+
+[fetchIssueWithIdentifier](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/issue-details/issue.store.ts#L270-L273) 使用相同的 expand 参数。
+
+### 11.5 列表请求的 expand 参数
+
+[IssueFilterHelperStore.computedFilteredParams](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/helpers/issue-filter-helper.store.ts#L92-L126) 在 Gantt 布局下自动添加 expand：
+
+```typescript
+if (ENABLE_ISSUE_DEPENDENCIES && displayFilters?.layout === EIssueLayoutTypes.GANTT)
+    issueFiltersParams["expand"] = "issue_relation,issue_related";
+```
+
+其他布局（Kanban、List、Calendar）**不传 expand 参数**，因此走 `.values()` 快速路径。
+
+### 11.6 Inbox 请求的 expand 参数
+
+[InboxIssueService.retrieve](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/inbox/inbox-issue.service.ts#L30-L33) 固定传 `expand=issue_inbox`：
+
+```typescript
+async retrieve(workspaceSlug, projectId, inboxIssueId) {
+    return this.get(
+      `/api/workspaces/${workspaceSlug}/projects/${projectId}/inbox-issues/${inboxIssueId}/?expand=issue_inbox`
+    );
+}
+```
+
+---
+
+## 十二、前端 Store 层对 TIssue/TIssuesResponse 的消费链路
+
+### 12.1 Store 层级结构
+
+```
+IssueRootStore (root.store.ts)
+├── serviceType: TIssueServiceType              ← 决定 URL 路由
+├── issues: IssueStore                          ← 全局 issuesMap (TIssue 字典)
+│
+├── issueDetail: IssueDetail (EPICS=epicDetail) ← 详情专用
+│   ├── issue: IssueStore (fetchIssue)          ← 详情 fetch + expand
+│   ├── relation: IssueRelationStore
+│   ├── link: IssueLinkStore
+│   ├── attachment: IssueAttachmentStore
+│   ├── reaction: IssueReactionStore
+│   ├── subscription: IssueSubscriptionStore
+│   ├── subIssues: SubIssuesStore
+│   ├── comment: IssueCommentStore
+│   └── activity: IssueActivityStore
+│
+├── projectIssues: ProjectIssues                ← 项目级列表
+│   └── issueFilterStore: ProjectIssuesFilter   ← getFilterParams()
+├── cycleIssues: CycleIssues                    ← Cycle 级列表
+├── moduleIssues: ModuleIssues                  ← Module 级列表
+├── projectViewIssues: ProjectViewIssues        ← 视图级列表
+├── workspaceIssues: WorkspaceIssues            ← 工作区级列表
+├── profileIssues: ProfileIssues                ← 用户档案级列表
+├── archivedIssues: ArchivedIssues              ← 归档列表
+└── projectEpics: ProjectEpics                  ← Epic 列表
+```
+
+### 12.2 TIssuesResponse 的处理流程
+
+[BaseIssuesStore.processIssueResponse](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/helpers/base-issues.store.ts#L1257-L1343) 解析 `TIssuesResponse`：
+
+```
+TIssuesResponse
+  ├── results: TIssueResponseResults
+  │     ├── TBaseIssue[]          → 无分组
+  │     ├── { [groupId]: { results: TBaseIssue[], total_results } }  → 单层分组
+  │     └── { [groupId]: { [subGroupId]: { results: TBaseIssue[], total_results } } } → 双层分组
+  ├── total_count
+  ├── next_cursor / prev_cursor
+  └── next_page_results / prev_page_results
+```
+
+**关键类型约束**：`TIssueResponseResults` 中 results 的元素类型是 `TBaseIssue`，而非 `TIssue`。这意味着 TypeScript 编译器不知道 expand 后返回的嵌套字段（如 `parent`、`issue_reactions`）。实际运行时返回的是 `TIssue`（包含展开字段），但类型系统只保证了 `TBaseIssue` 的字段存在。
+
+### 12.3 列表数据入库路径
+
+```
+ProjectIssues.fetchIssues()
+  → issueFilterStore.getFilterParams()       ← 组装查询参数（含 expand）
+  → issueService.getIssues()                 ← HTTP 请求
+  → onfetchIssues(response, options)         ← 处理响应
+      → processIssueResponse(response)       ← 从 results 提取 TIssue[]
+      → rootIssueStore.issues.addIssue(list) ← 写入全局 issuesMap
+      → updateGroupedIssueIds()              ← 更新分组 ID 列表
+      → issueDetail.relation.extractRelationsFromIssues()  ← 提取关系
+```
+
+[IssueStore.addIssue](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/issue.store.ts#L61-L75) 对已存在的 issue 做 merge 更新：
+
+```typescript
+addIssue = (issues: TIssue[]) => {
+    issues.forEach((issue) => {
+        if (!this.issuesMap[issue.id]) set(this.issuesMap, issue.id, issue);
+        else update(this.issuesMap, issue.id, (prevIssue) => ({ ...prevIssue, ...issue }));
+    });
+};
+```
+
+**这意味着列表接口返回的 `TBaseIssue` 数据会覆盖详情接口已写入的 `TIssue` 展开字段（如 `issue_reactions`），如果列表接口不返回这些字段，展开数据会丢失。** 但由于 `update` 使用 spread，`undefined` 值不会覆盖已有值——只有当列表接口显式返回了某个字段的 `null` 时才会丢失。
+
+### 12.4 详情数据入库路径
+
+```
+IssueDetail.issue.fetchIssue()
+  → issueService.retrieve(id, { expand: "issue_reactions,issue_attachments,issue_link,parent" })
+  → addIssueToStore(issue)                   ← 手动构造 TIssue payload
+  → rootIssueStore.issues.addIssue([payload])
+  → 分发到各子 store:
+      ├── issue_reactions → addReactions()
+      ├── issue_link → addLinks()
+      ├── issue_attachments → addAttachments()
+      ├── is_subscribed → addSubscription()
+      └── 子请求: fetchActivities, fetchComments, fetchSubIssues, fetchRelations
+```
+
+[addIssueToStore](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/issue-details/issue.store.ts#L142-L179) 手动提取 TIssue 字段：
+
+```typescript
+addIssueToStore = (issue: TIssue) => {
+    const issuePayload: TIssue = {
+      id: issue?.id,
+      sequence_id: issue?.sequence_id,
+      name: issue?.name,
+      description_html: issue?.description_html,
+      sort_order: issue?.sort_order,
+      state_id: issue?.state_id,
+      priority: issue?.priority,
+      label_ids: issue?.label_ids,
+      assignee_ids: issue?.assignee_ids,
+      estimate_point: issue?.estimate_point,
+      sub_issues_count: issue?.sub_issues_count,
+      attachment_count: issue?.attachment_count,
+      link_count: issue?.link_count,
+      project_id: issue?.project_id,
+      parent_id: issue?.parent_id,
+      cycle_id: issue?.cycle_id,
+      module_ids: issue?.module_ids,
+      type_id: issue?.type_id,
+      created_at: issue?.created_at,
+      updated_at: issue?.updated_at,
+      start_date: issue?.start_date,
+      target_date: issue?.target_date,
+      completed_at: issue?.completed_at,
+      archived_at: issue?.archived_at,
+      created_by: issue?.created_by,
+      updated_by: issue?.updated_by,
+      is_draft: issue?.is_draft,
+      is_subscribed: issue?.is_subscribed,
+      is_epic: issue?.is_epic,
+    };
+    ...
+};
+```
+
+**注意**：`addIssueToStore` 没有提取 `parent`、`issue_reactions`、`issue_attachments`、`issue_link` 等展开字段到 `issuePayload`。这些数据是通过后续的 `addReactions`、`addLinks`、`addAttachments` 调用分别存入子 store，而非合并到 `issuesMap` 中的 issue 对象。
+
+**另一个注意**：`is_epic` 字段在此被手动写入 store，但来源是 [retrieve 方法](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/issue/issue.service.ts#L117-L122) 中的客户端注入：
+
+```typescript
+if (response.data && this.serviceType === EIssueServiceType.EPICS) {
+    response.data.is_epic = true;
+}
+```
+
+`is_epic` 不是后端返回的字段，而是前端在 Epic serviceType 下手动设为 `true`。这解释了为什么 `TBaseIssue` 定义了 `is_epic?` 但后端序列化器不返回它。
+
+### 12.5 TIssueParams — 查询参数类型
+
+定义在 [packages/types/src/view-props.ts#L63-L89](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/view-props.ts#L63-L89)：
+
+```typescript
+export type TIssueParams =
+  | "priority" | "state_group" | "state" | "assignees" | "mentions"
+  | "created_by" | "subscriber" | "labels" | "cycle" | "module"
+  | "start_date" | "target_date" | "project" | "team_project"
+  | "group_by" | "sub_group_by" | "order_by" | "type" | "sub_issue"
+  | "show_empty_groups" | "cursor" | "per_page" | "issue_type"
+  | "layout" | "expand" | "filters";
+```
+
+`expand` 和 `filters` 都是合法的查询参数，在 `computedFilteredParams` 中被设置。
+
+---
+
+## 十三、前端 expand 请求字段名与后端 expansion mapper 的一致性核对
+
+### 13.1 前端发出的 expand 值汇总
+
+| 发起位置 | expand 值 | 请求路径 |
+|---------|----------|---------|
+| 详情 fetchIssue | `issue_reactions,issue_attachments,issue_link,parent` | `/issues/{id}/` |
+| 详情 fetchIssueWithIdentifier | `issue_reactions,issue_attachments,issue_link,parent` | `/work-items/{identifier}/` |
+| 列表 Gantt 布局 | `issue_relation,issue_related` | `/issues/` 或 `/issues-detail/` |
+| Inbox retrieve | `issue_inbox` | `/inbox-issues/{id}/` |
+
+### 13.2 后端 expansion mapper 支持的 expand 值
+
+app 层 mapper（[app/serializers/base.py#L74-L96](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/serializers/base.py#L74-L96)）支持的完整列表：
+
+`user`, `workspace`, `project`, `state`, `assignees`, `labels`, `parent`, `sub_issues`, `issue_cycle`, `issue_relation`, `issue_reactions`, `issue_link`, `issue_attachment`, `default_assignee`, `project_lead`, `created_by`, `actor`, `owned_by`, `updated_by`, `issue_related`
+
+### 13.3 逐项核对
+
+| 前端 expand 值 | 后端 mapper 是否支持 | 后端 view 是否 prefetch | 一致性 |
+|---------------|-------------------|----------------------|-------|
+| `issue_reactions` | ✅ IssueReactionLiteSerializer | ✅ retrieve 有 prefetch_related | ✅ 一致 |
+| `issue_attachments` | ✅ IssueAttachmentLiteSerializer | ✅ to_representation 手动查 FileAsset | ✅ 一致 |
+| `issue_link` | ✅ IssueLinkLiteSerializer | ✅ retrieve 有 prefetch_related | ✅ 一致 |
+| `parent` | ✅ IssueLiteSerializer | ✅ retrieve 有 select_related | ✅ 一致 |
+| `issue_relation` | ✅ IssueRelationSerializer | ✅ IssueDetailEndpoint 有 prefetch_related | ✅ 一致 |
+| `issue_related` | ✅ RelatedIssueSerializer | ✅ IssueDetailEndpoint 有 prefetch_related | ✅ 一致 |
+| `issue_inbox` | ❌ **不在 mapper 中** | N/A (Inbox 有独立序列化) | ⚠️ 见下文 |
+
+### 13.4 `issue_inbox` 的特殊情况
+
+前端 `InboxIssueService.retrieve` 发送 `expand=issue_inbox`，但 app 层 expansion mapper 中**没有** `issue_inbox` 条目。这是因为 inbox 请求走的是独立的 `InboxIssueViewSet`，其序列化器是 `InboxIssueSerializer`，不是通用的 `IssueSerializer`。`issue_inbox` 在 `InboxIssueSerializer` 内部处理，不走通用 expansion mapper。
+
+**风险**：如果有人误将 `expand=issue_inbox` 传给普通 issue 端点，`DynamicBaseSerializer._filter_fields` 不会识别这个 expand 值，会静默忽略。
+
+### 13.5 `issue_attachments` vs `issue_attachment` 命名差异
+
+前端请求 `expand=issue_attachments`（复数），后端 mapper 注册的是 `issue_attachment`（单数）。但在 `DynamicBaseSerializer.to_representation` 中有特殊处理：
+
+```python
+if "issue_attachments" in self.expand:
+    # 手动查询 FileAsset
+```
+
+所以 mapper 中的 key 是 `issue_attachment`（用于 `_filter_fields` 阶段添加字段），但 `to_representation` 阶段检查的是 `issue_attachments`（复数）。**两者同时存在且必须同时修改**，否则会出现字段被添加但数据不被展开的情况。
+
+### 13.6 列表接口不支持 expand 的路径
+
+当列表请求**不含** expand 时（普通 Kanban/List/Calendar 布局），请求走 `IssueViewSet.list` → `issue_on_results` → `.values()` 路径，**完全绕过序列化器和 expansion mapper**。此时前端传入的任何 expand 参数都会被忽略（因为 `.values()` 不处理 expand）。
+
+**只有在 Gantt 布局或包含 `issue_relation` 的 expand 请求时**，才会路由到 `IssueDetailEndpoint`，该端点使用 `IssueListDetailSerializer` 处理 expand。
+
+---
+
+## 十四、类型变更进入列表和详情视图的完整传导路径
+
+### 14.1 新增字段的完整传导
+
+假设后端新增 `story_point` 字段（Model → Serializer → Frontend）：
+
+```
+1. Django Model: Issue.story_point = models.IntegerField(null=True)
+   ↓
+2. 后端序列化器（5 处手动同步）:
+   ├── IssueSerializer.Meta.fields += ("story_point",)
+   ├── IssueDetailSerializer.Meta.fields += ("story_point",)
+   ├── IssueListDetailSerializer.to_representation() += "story_point": instance.story_point
+   ├── IssueViewSet.list .values() += "story_point"
+   └── grouper.issue_on_results required_fields += "story_point"
+   ↓
+3. 后端 expansion mapper（可选，如需展开）:
+   └── base.py mapper += "story_point": StoryPointSerializer
+   ↓
+4. 前端类型更新:
+   └── TBaseIssue += story_point: number | null
+   ↓
+5. 前端 Store 层（关键！两处手动同步）:
+   ├── IssueDetail.addIssueToStore() += story_point: issue?.story_point
+   └── BaseIssuesStore.ISSUE_ORDERBY_KEY += story_point: "story_point"（如需排序）
+   ↓
+6. 前端视图组件:
+   └── 各显示/编辑组件引用 issue.story_point
+```
+
+**步骤 5 是前次分析中遗漏的关键环节**：`addIssueToStore` 手动枚举了 TIssue 的每个字段，新增字段必须同步添加到此方法，否则详情接口返回的数据写入 `issuesMap` 后该字段会丢失。
+
+### 14.2 字段类型变更的传导
+
+假设后端将 `estimate_point` 从 `ForeignKey` 改为 `IntegerField`：
+
+```
+1. Django Model: estimate_point = models.IntegerField(null=True)  (原 ForeignKey → Point)
+   ↓
+2. 后端序列列化器:
+   ├── IssueSerializer: estimate_point 自动从 PK 变为 int
+   ├── IssueListDetailSerializer: estimate_point_id 不再存在（手动取 _id 报错）
+   └── DynamicBaseSerializer: expansion mapper 中 estimate_point 展开逻辑失效
+   ↓
+3. 前端:
+   ├── TBaseIssue.estimate_point: string | null → number | null（需手动改）
+   ├── ISSUE_ORDERBY_KEY: estimate_point__key 排序失效（后端字段不存在）
+   └── ISSUE_FILTER_DEFAULT_DATA: 无影响
+```
+
+**`estimate_point` 的特殊风险**：当前 `estimate_point` 在 Model 中是 FK 到 `Estimate` 模型。`IssueSerializer` 中 `estimate_point = serializers.PrimaryKeyRelatedField(read_only=True)` 返回 UUID string。如果后端改为返回整数 key，前端 `TBaseIssue.estimate_point: string | null` 就会收到 `number`，类型不匹配但运行时不报错（TypeScript 类型只在编译时检查）。
+
+### 14.3 前端 is_epic 的特殊传导
+
+`is_epic` 字段的传导路径与普通字段完全不同：
+
+```
+1. 后端: IssueSerializer 不包含 is_epic（不返回）
+   ↓
+2. IssueService.retrieve():
+   ├── serviceType === EPICS → response.data.is_epic = true  (客户端注入)
+   └── serviceType !== EPICS → 不设置 is_epic (undefined)
+   ↓
+3. IssueDetail.addIssueToStore():
+   └── is_epic: issue?.is_epic  (存入 issuesMap)
+   ↓
+4. 组件消费: issue.is_epic === true 判断是否为 Epic
+```
+
+**风险**：如果后端决定新增 `is_epic` 字段到序列化器，前端客户端注入逻辑仍会执行，可能导致 `is_epic` 被覆盖为 `true`，即使后端返回 `false`。
+
+---
+
+## 十五、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -453,9 +859,21 @@ api 层已使用 `drf-spectacular` 生成 OpenAPI schema，可通过 CI 流程�
 | [app/views/issue/base.py](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/app/views/issue/base.py) | Issue 列表/详情视图 |
 | [api/views/issue.py](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/api/views/issue.py) | api 层 Issue 端点 |
 | [utils/grouper.py](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/api/plane/plane/utils/grouper.py) | issue_on_results 手写字段列表 |
-| [packages/types/src/issues/issue.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue.ts) | 前端 TBaseIssue / TIssue 类型 |
+| [packages/types/src/issues/issue.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue.ts) | 前端 TBaseIssue / TIssue / EIssueServiceType 类型 |
+| [packages/types/src/view-props.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/view-props.ts) | 前端 TIssueParams 查询参数类型 |
 | [packages/types/src/users.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/users.ts) | 前端 IUserLite / IUser 类型 |
 | [packages/types/src/issues/issue_relation.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue_relation.ts) | 前端 TIssueRelation 类型 |
 | [packages/types/src/issues/issue_attachment.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue_attachment.ts) | 前端 TIssueAttachment 类型 |
 | [packages/types/src/issues/issue_link.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue_link.ts) | 前端 TIssueLink 类型 |
 | [packages/types/src/issues/issue_reaction.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/types/src/issues/issue_reaction.ts) | 前端 TIssueReaction 类型 |
+| [packages/services/src/api.service.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/packages/services/src/api.service.ts) | 基础 HTTP 服务 (axios 封装) |
+| [services/issue/issue.service.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/issue/issue.service.ts) | 前端 IssueService (列表/详情/CRUD) |
+| [services/inbox/inbox-issue.service.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/services/inbox/inbox-issue.service.ts) | 前端 InboxIssueService |
+| [store/issue/root.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/root.store.ts) | IssueRootStore (顶层状态管理) |
+| [store/issue/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/issue.store.ts) | 全局 issuesMap (TIssue 字典) |
+| [store/issue/helpers/base-issues.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/helpers/base-issues.store.ts) | BaseIssuesStore (列表逻辑 + processIssueResponse) |
+| [store/issue/helpers/issue-filter-helper.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/helpers/issue-filter-helper.store.ts) | 查询参数组装 + expand 逻辑 |
+| [store/issue/project/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/project/issue.store.ts) | ProjectIssues (项目级列表) |
+| [store/issue/project/filter.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/project/filter.store.ts) | ProjectIssuesFilter (getFilterParams) |
+| [store/issue/issue-details/issue.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/issue-details/issue.store.ts) | IssueDetail.fetchIssue + addIssueToStore |
+| [store/issue/issue-details/root.store.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/199-plane/apps/web/core/store/issue/issue-details/root.store.ts) | IssueDetail (详情子 store 组合) |
