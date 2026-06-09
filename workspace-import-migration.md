@@ -40,6 +40,13 @@ Plane 的导入/迁移体系在代码层面涉及两套 API，但两者的实际
 | SingleIntegrationCard 组件 | `apps/web/core/components/integration/single-integration-card.tsx` |
 | 项目级 IntegrationCard 组件 | `apps/web/core/components/project/integration-card.tsx` |
 | 定价/计划对比（含 Importers 描述） | `apps/web/core/constants/plans.tsx` |
+| 路由注册入口 | `apps/web/app/routes.ts` |
+| 核心路由定义（含 workspace settings 路由列表） | `apps/web/app/routes/core.ts` |
+| 扩展路由定义（当前为空） | `apps/web/app/routes/extended.ts` |
+| 路由合并辅助函数 | `apps/web/app/routes/helper.ts` |
+| React Router 配置 | `apps/web/react-router.config.ts` |
+| 工作区设置 Layout（含权限校验） | `apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/layout.tsx` |
+| 设置页面辅助函数（pathnameToAccessKey） | `apps/web/core/components/settings/helper.ts` |
 | Issue 模型 (external_id) | `apps/api/plane/db/models/issue.py` |
 | Label 模型 (external_id) | `apps/api/plane/db/models/label.py` |
 | State 模型 (external_id) | `apps/api/plane/db/models/state.py` |
@@ -593,15 +600,77 @@ GET /api/v1/workspaces/{slug}/projects/{id}/work-items/?external_id=JIRA-456&ext
 
 **关键发现：侧边栏中无 `import` / `importer` / `integrations` 菜单项。** 用户在标准导航中无法找到导入入口。
 
-### 7.2 Integrations 页面 — 文件存在但不可导航
+### 7.2 Integrations 页面 — 文件存在但路由未注册，URL 不可达
 
-尽管文件系统中存在 `apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/integrations/page.tsx`，该页面可被直接 URL 访问（`/{workspaceSlug}/settings/integrations/`），但：
+尽管文件系统中存在 `apps/web/app/(all)/[workspaceSlug]/(settings)/settings/(workspace)/integrations/page.tsx`，该页面在当前构建中 **不可通过 URL 访问**。原因链如下：
 
-- **侧边栏无入口**：`WORKSPACE_SETTINGS` 不包含 integrations 项
-- **Power K 无入口**：工作区设置快捷命令仅列举 `WORKSPACE_SETTINGS` 中定义的页面
-- **该页面展示的内容**：调用 `IntegrationService.getAppIntegrationsList()` 获取 GitHub/Slack 等 OAuth 集成列表，使用 `SingleIntegrationCard` 展示安装/卸载按钮。**这是 OAuth 集成（同步），不是导入器（importer）。**
+#### 路由注册链
 
-`SingleIntegrationCard` 组件仅处理 OAuth 安装/卸载（`useIntegrationPopup` → 重定向到 GitHub/Slack OAuth 授权），不涉及数据导入功能。
+Plane 前端使用 React Router v7（`@react-router/dev/routes`），路由通过代码显式注册，**不支持文件系统自动发现**：
+
+```
+routes.ts
+  ├─ import { coreRoutes } from "./routes/core"
+  ├─ import { extendedRoutes } from "./routes/extended"
+  ├─ mergeRoutes(coreRoutes, extendedRoutes)
+  └─ [...mergedRoutes, route("*", "./not-found.tsx")]  ← 404 兜底
+```
+
+1. **`routes/core.ts`**（L258-L285）— 工作区设置区域注册了 6 条路由：
+
+```typescript
+layout("./(all)/[workspaceSlug]/(settings)/settings/(workspace)/layout.tsx", [
+  route(":workspaceSlug/settings", ".../page.tsx"),           // general
+  route(":workspaceSlug/settings/members", ".../page.tsx"),   // members
+  route(":workspaceSlug/settings/billing", ".../page.tsx"),   // billing
+  route(":workspaceSlug/settings/exports", ".../page.tsx"),   // exports
+  route(":workspaceSlug/settings/webhooks", ".../page.tsx"),  // webhooks
+  route(":workspaceSlug/settings/webhooks/:webhookId", "..."), // webhook detail
+])
+```
+
+**无 `:workspaceSlug/settings/integrations` 路由。**
+
+2. **`routes/extended.ts`** — 扩展路由数组为空：
+
+```typescript
+export const extendedRoutes: RouteConfigEntry[] = [];
+```
+
+3. **`react-router.config.ts`** — 未启用文件系统路由发现：
+
+```typescript
+export default { appDirectory: "app", ssr: false } satisfies Config;
+```
+
+#### 访问结果推演
+
+| 访问方式 | 结果 | 原因 |
+|----------|------|------|
+| 侧边栏点击 | ❌ 不可达 | `WORKSPACE_SETTINGS` 不含 integrations 项 |
+| 直接输入 URL `/{slug}/settings/integrations/` | ❌ 404 页面 | 路由未注册，命中 `route("*", "./not-found.tsx")` 兜底 |
+| Power K 快捷命令 | ❌ 不可达 | 工作区设置命令仅列举 `WORKSPACE_SETTINGS` 中的页面 |
+| 代码内部链接 | ❌ 不可达 | 全仓库 `grep "settings/integrations"` 零匹配 |
+
+#### 页面内容分析（假设可访问）
+
+即使该页面可达，其内容也与 importer 无关：
+
+- 调用 `IntegrationService.getAppIntegrationsList()` → `GET /api/integrations/` 获取 GitHub/Slack OAuth 应用列表
+- 使用 `SingleIntegrationCard` 展示安装/卸载按钮
+- `SingleIntegrationCard` 通过 `useIntegrationPopup` 触发 OAuth 授权流程
+- **这是 OAuth 集成（同步），不是数据导入（importer）**
+
+#### 工作区设置布局的权限校验
+
+`settings/(workspace)/layout.tsx` 使用 `WORKSPACE_SETTINGS_ACCESS` 进行权限校验：
+
+```typescript
+const { accessKey } = pathnameToAccessKey(pathname);
+isAuthorized = WORKSPACE_SETTINGS_ACCESS[accessKey]?.includes(userWorkspaceRole);
+```
+
+`WORKSPACE_SETTINGS_ACCESS` 由 `WORKSPACE_SETTINGS` 自动生成，不含 `/settings/integrations` 键。即使绕过路由注册直接访问，权限校验也会因 `undefined` 而拒绝渲染。
 
 ### 7.3 导入器 Service 方法 — 已定义但从未被调用
 
@@ -642,8 +711,9 @@ SWR 缓存键 `IMPORTER_SERVICES_LIST`、`JIRA_IMPORTER_DETAIL`、`GITHUB_REPOSI
 
 | 维度 | 状态 | 说明 |
 |------|------|------|
-| 导航入口 | ❌ | 侧边栏无 Importer/Import 菜单项 |
-| URL 直接访问 | ❌ | 无 importer 相关页面路由 |
+| 路由注册 | ❌ | `routes/core.ts` 不含 `settings/integrations`；`routes/extended.ts` 为空数组 |
+| 导航入口 | ❌ | 侧边栏无 Importer/Import/Integrations 菜单项 |
+| URL 直接访问 | ❌ | 未注册路由命中 404 兜底；即使绕过，`WORKSPACE_SETTINGS_ACCESS` 也会拒绝 |
 | 导入向导组件 | ❌ | 无 Jira/GitHub 导入配置/预览/映射 UI |
 | 导入进度展示 | ❌ | 无进度条、状态轮询、历史记录组件 |
 | Service 层 | ⚠️ | 类和方法已定义，但零调用 |
@@ -651,7 +721,7 @@ SWR 缓存键 `IMPORTER_SERVICES_LIST`、`JIRA_IMPORTER_DETAIL`、`GITHUB_REPOSI
 | SWR 缓存键 | ⚠️ | 已定义，但零引用 |
 | 后端 API | ❌ | 无 View/URL/Task |
 
-**结论：开源前端不具备可操作的 importers 入口和导入进度展示功能。** 前端代码中仅保留了 Service 层和类型定义作为"接口骨架"，推测是为 Plane 云端版本的导入器 UI 预留的契约，自部署环境无法使用。
+**结论：开源前端不具备可操作的 importers 入口和导入进度展示功能。** `integrations/page.tsx` 是一个死文件（路由未注册、无任何链接指向），且其内容是 OAuth 集成而非数据导入。导入器相关的 Service/Type 仅保留了"接口骨架"，推测为 Plane 云端版本预留的契约，自部署环境无法使用。
 
 ---
 
