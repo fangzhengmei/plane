@@ -133,15 +133,18 @@ InstanceConfiguration.objects.filter(
 
 **结论**：`ENABLE_SMTP` 在所有后端邮件发送路径（`get_email_configuration()`、Celery 任务、视图层）中均**未被读取或判断**。它是一个纯 UI 层开关，仅控制 Admin 界面的表单显示/隐藏。
 
-具体来说，以下所有调用点都不检查 `ENABLE_SMTP`：
-- [forgot_password.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/views/app/password_management.py#L87) — 无条件触发
-- [magic_link.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/views/app/magic.py#L54) — 无条件触发
-- [workspace_invitation.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/workspace/invite.py#L121) — 无条件触发
-- [project_invitations.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L105) — 无条件触发
-- [project_add_user_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/member.py#L144) — 无条件触发
-- [user_activation_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/adapter/base.py#L230) — 无条件触发
-- [user_deactivation_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/user/base.py#L343) — 无条件触发
+具体来说，以下所有**非认证类**调用点都不检查 `EMAIL_HOST` 或 `ENABLE_SMTP`：
+- [workspace_invitation.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/workspace/invite.py#L121) — 无条件触发，SMTP 失败静默
+- [project_invitations.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L105) — 无条件触发（⚠️ 存在调用错误，见第 5 节）
+- [project_add_user_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/member.py#L144) — 无条件触发，SMTP 失败静默
+- [user_activation_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/adapter/base.py#L230) — 无条件触发，SMTP 失败静默
+- [user_deactivation_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/user/base.py#L343) — 无条件触发，SMTP 失败静默
 - [stack_email_notification](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/bgtasks/email_notification_task.py#L46-L84) — Beat 定时无条件触发
+
+而以下**认证类**入口在视图层对 `EMAIL_HOST` 做了预检（见第 5 节详述）：
+- [ForgotPasswordEndpoint.post()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/views/app/password_management.py#L62-L69) — 检查 `EMAIL_HOST`，空则返回 `SMTP_NOT_CONFIGURED`
+- [ForgotPasswordSpaceEndpoint.post()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/views/space/password_management.py#L76-L81) — 同上
+- [MagicCodeProvider.__init__()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/provider/credentials/magic_code.py#L36-L41) — 检查 `EMAIL_HOST`，空则抛出 `SMTP_NOT_CONFIGURED`
 
 ---
 
@@ -435,7 +438,103 @@ WHERE processed_at IS NOT NULL AND sent_at IS NULL;
 
 ---
 
-## 5. 完整调用链路图
+## 5. 邮件发送入口的分流路径
+
+Plane 的邮件发送入口分为三条截然不同的路径，对 SMTP 未配置的响应行为完全不同：
+
+### 5.1 路径 A：认证入口 — EMAIL_HOST 预检，提前报 SMTP_NOT_CONFIGURED
+
+以下 3 个认证入口在**视图层/Provider 层**就会读取 `EMAIL_HOST` 并做预检，若为空则直接返回错误码 `5025`（`SMTP_NOT_CONFIGURED`），**不会进入 Celery 任务**：
+
+| 入口 | 预检位置 | 预检代码 | HTTP 响应 |
+|------|----------|----------|-----------|
+| [ForgotPasswordEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/views/app/password_management.py#L62-L69) (App) | `post()` 方法 | `(EMAIL_HOST,) = get_configuration_value([...])` → `if not (EMAIL_HOST)` | 400 `{"error_code": 5025, "error_message": "SMTP_NOT_CONFIGURED"}` |
+| [ForgotPasswordSpaceEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/views/space/password_management.py#L76-L81) (Space) | `post()` 方法 | 同上 | 同上 |
+| [MagicCodeProvider](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/provider/credentials/magic_code.py#L36-L41) | `__init__()` | `(EMAIL_HOST, ENABLE_MAGIC_LINK_LOGIN) = get_configuration_value([...])` → `if not (EMAIL_HOST)` | 抛出 `AuthenticationException`，由上层捕获返回 400 |
+
+**预检逻辑的关键细节**：
+
+1. 这 3 个入口检查的是 `EMAIL_HOST`（通过 `get_configuration_value` 从 DB 读取），**不是** `ENABLE_SMTP`。只有 `EMAIL_HOST` 为空时才触发 `SMTP_NOT_CONFIGURED`。
+2. `MagicCodeProvider` 额外检查了 `ENABLE_MAGIC_LINK_LOGIN`（默认 `"1"`），若为 `"0"` 则抛出 `MAGIC_LINK_LOGIN_DISABLED`（错误码 `5016`）。这是唯一一个既检查 `EMAIL_HOST` 又检查功能开关的入口。
+3. 预检通过后才调用 `forgot_password.delay()` 或 `magic_link.delay()`，进入 Celery 异步发送。
+4. **前端联动**：前端在 [auth.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/packages/utils/src/auth.ts#L106-L108) 中注册了 `SMTP_NOT_CONFIGURED`（错误码 `5025`）的翻译文案："SMTP not configured. Please contact your administrator."，在 [authentication.helper.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/web/helpers/authentication.helper.tsx#L152-L154) 中会弹窗展示。
+
+**影响**：用户在 SMTP 未配置时请求"忘记密码"或"Magic Link 登录"，会立即收到明确的错误提示，不会产生悬空请求。
+
+### 5.2 路径 B：业务入口 — 无预检，SMTP 失败静默
+
+以下 5 个业务入口在视图层**不做任何 SMTP 预检**，直接 `task.delay()` 投递到 Celery：
+
+| 入口 | Celery 任务 | 失败行为 |
+|------|------------|---------|
+| [WorkspaceInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/workspace/invite.py#L120-L127) | `workspace_invitation` | `except Exception: log_exception(e); return` |
+| [ProjectInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L104-L111) | `project_invitations` ⚠️ | `except Exception: log_exception(e); return` |
+| [ProjectMemberAPIView.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/member.py#L144-L149) | `project_add_user_email` | `except Exception: log_exception(e); return` |
+| [UserActivationEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/adapter/base.py#L230) | `user_activation_email` | `except Exception: log_exception(e); return` |
+| [UserDeactivationView](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/user/base.py#L343) | `user_deactivation_email` | `except Exception: log_exception(e); return` |
+
+**影响**：SMTP 未配置时，这些入口的 HTTP 响应仍然返回 200（如 "Email sent successfully"），但邮件实际不会发出，用户无法感知失败。邀请记录已在 DB 中创建，但邀请邮件永远不会送达。
+
+### 5.3 路径 C：Issue 通知 — 两阶段异步，失败产生死信
+
+详见第 4 节。关键特征：
+- [notifications()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/bgtasks/notification_task.py#L191-L674) 在创建 `EmailNotificationLog` 时不检查 SMTP 配置
+- [stack_email_notification](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/bgtasks/email_notification_task.py#L47-L84) 在聚合阶段也不检查 SMTP 配置
+- [send_email_notification](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/bgtasks/email_notification_task.py#L152-L306) 发送失败后 `sent_at` 保持 `None`，记录进入死信状态
+
+**与路径 B 的区别**：路径 C 的失败状态可以通过查询 `EmailNotificationLog` 发现（`processed_at≠None, sent_at=None`），而路径 B 的失败完全无记录。
+
+### 5.4 项目邀请路径的调用错误
+
+[ProjectInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L104-L111) 中存在一个调用名称错误：
+
+```python
+# 实际代码（第 105 行）
+project_invitations.delay(
+    invitation.email,
+    project_id,
+    invitation.token,
+    current_site,
+    request.user.email,
+)
+```
+
+**问题**：
+- 代码调用的是 `project_invitations`（复数），但文件中没有 import 任何名为 `project_invitations` 的对象
+- 对应的 Celery 任务函数名为 [project_invitation](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/bgtasks/project_invitation_task.py#L24)（单数），定义在 `plane.bgtasks.project_invitation_task` 模块中
+- 对比工作区邀请视图，[WorkspaceInvitationsViewset](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/workspace/invite.py#L29) 正确地 import 了 `workspace_invitation` 并调用
+
+**后果**：
+- 此代码在运行时会抛出 `NameError: name 'project_invitations' is not defined`，导致项目邀请邮件**永远不会被发送**
+- 由于 `project_invitations.delay(...)` 在 `for invitation in project_invitations:` 循环内，`NameError` 不会被外层 try-except 捕获（视图的 `create()` 方法没有 try-except），会导致整个请求返回 500 错误
+- `ProjectMemberInvite` 记录已在第 98-100 行通过 `bulk_create` 写入 DB，但对应的邮件不会发出，邀请处于"已创建但未通知"的悬挂状态
+
+**修复建议**：在文件头部添加正确的 import，并修正调用名称：
+
+```python
+from plane.bgtasks.project_invitation_task import project_invitation
+
+# 调用处改为
+project_invitation.delay(
+    invitation.email,
+    project_id,
+    invitation.token,
+    current_site,
+    request.user.email,
+)
+```
+
+### 5.5 分流路径汇总
+
+| 路径 | 入口 | SMTP 预检 | 失败可观测性 | 用户感知 |
+|------|------|-----------|------------|---------|
+| A: 认证 | 忘记密码 / Magic Link | ✅ 视图层检查 `EMAIL_HOST` | HTTP 400 + 错误码 5025 | 即时看到"SMTP not configured" |
+| B: 业务 | 工作区邀请 / 项目邀请 / 项目添加成员 / 激活 / 停用 | ❌ 无 | 仅 Celery Worker 日志 | 看到"Email sent successfully"但邮件未到 |
+| C: Issue 通知 | Celery Beat 定时触发 | ❌ 无 | `EmailNotificationLog` 死信 | 无直接感知 |
+
+---
+
+## 6. 完整调用链路图
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -497,7 +596,7 @@ WHERE processed_at IS NOT NULL AND sent_at IS NULL;
 
 ---
 
-## 6. 运维接入邮件网关的注意事项
+## 7. 运维接入邮件网关的注意事项
 
 1. **配置热加载**：在 Admin UI 修改 SMTP 配置后，下一个 Celery 任务执行时即生效，无需重启任何服务。但 `EMAIL_BACKEND` 本身是硬编码的，不可通过 UI 切换。
 
@@ -516,3 +615,10 @@ WHERE processed_at IS NOT NULL AND sent_at IS NULL;
 8. **死信重投递**：`processed_at≠None, sent_at=None` 的记录处于"死信"状态，无自动重投递路径。运维可通过 SQL 将 `processed_at` 重置为 `NULL` 手动重投递（见 4.3 节），但需先确保 SMTP 配置已恢复正常，否则会再次进入死信。
 
 9. **禁用后的静默失败**：禁用邮件后，所有发送任务仍会被触发并执行，只是因 `EMAIL_HOST=""` 导致连接失败后静默返回。Celery Worker 日志中会出现大量 `SMTPConnectError`，但不会影响业务流程（如邀请创建、密码重置请求仍会返回 200）。
+
+10. **项目邀请邮件当前不可用**：[ProjectInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L105) 调用了不存在的 `project_invitations`（应为 `project_invitation`），导致 `NameError`，项目邀请邮件**在当前代码下永远不会被发送**（详见 5.4 节）。接入邮件网关前需先修复此 bug。
+
+11. **三条分流路径的运维监控策略不同**：
+    - **路径 A（认证）**：SMTP 未配置时用户会看到明确错误，运维无需额外监控。但若 SMTP 凭据错误（`EMAIL_HOST` 非空但认证失败），预检无法拦截，失败在 Celery Worker 中静默。
+    - **路径 B（业务）**：SMTP 未配置时接口仍返回 200，需在邮件网关侧监控 NDR 退信，或在 Celery Worker 日志中设置 `SMTPConnectError` 告警。
+    - **路径 C（Issue 通知）**：可通过定期查询 `EmailNotificationLog` 中 `processed_at≠None AND sent_at=None` 的记录来发现死信。
