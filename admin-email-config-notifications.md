@@ -135,7 +135,7 @@ InstanceConfiguration.objects.filter(
 
 具体来说，以下所有**非认证类**调用点都不检查 `EMAIL_HOST` 或 `ENABLE_SMTP`：
 - [workspace_invitation.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/workspace/invite.py#L121) — 无条件触发，SMTP 失败静默
-- [project_invitations.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L105) — 无条件触发（⚠️ 存在调用错误，见第 5 节）
+- [project_invitations.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L105) — 变量遮蔽导致 `AttributeError`（⚠️ 见第 5.4 节）
 - [project_add_user_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/member.py#L144) — 无条件触发，SMTP 失败静默
 - [user_activation_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/adapter/base.py#L230) — 无条件触发，SMTP 失败静默
 - [user_deactivation_email.delay()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/user/base.py#L343) — 无条件触发，SMTP 失败静默
@@ -463,17 +463,16 @@ Plane 的邮件发送入口分为三条截然不同的路径，对 SMTP 未配�
 
 ### 5.2 路径 B：业务入口 — 无预检，SMTP 失败静默
 
-以下 5 个业务入口在视图层**不做任何 SMTP 预检**，直接 `task.delay()` 投递到 Celery：
+以下 4 个业务入口在视图层**不做任何 SMTP 预检**，直接 `task.delay()` 投递到 Celery：
 
 | 入口 | Celery 任务 | 失败行为 |
 |------|------------|---------|
 | [WorkspaceInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/workspace/invite.py#L120-L127) | `workspace_invitation` | `except Exception: log_exception(e); return` |
-| [ProjectInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L104-L111) | `project_invitations` ⚠️ | `except Exception: log_exception(e); return` |
 | [ProjectMemberAPIView.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/member.py#L144-L149) | `project_add_user_email` | `except Exception: log_exception(e); return` |
 | [UserActivationEndpoint](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/authentication/adapter/base.py#L230) | `user_activation_email` | `except Exception: log_exception(e); return` |
 | [UserDeactivationView](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/user/base.py#L343) | `user_deactivation_email` | `except Exception: log_exception(e); return` |
 
-**影响**：SMTP 未配置时，这些入口的 HTTP 响应仍然返回 200（如 "Email sent successfully"），但邮件实际不会发出，用户无法感知失败。邀请记录已在 DB 中创建，但邀请邮件永远不会送达。
+**影响**：SMTP 未配置时，这些入口的 HTTP 响应仍然返回 200（如 "Emails sent successfully"），但邮件在 Celery Worker 中因 `SMTPConnectError` 静默失败，用户无法感知。邀请记录已在 DB 中创建，但邀请邮件不会送达。
 
 ### 5.3 路径 C：Issue 通知 — 两阶段异步，失败产生死信
 
@@ -484,32 +483,66 @@ Plane 的邮件发送入口分为三条截然不同的路径，对 SMTP 未配�
 
 **与路径 B 的区别**：路径 C 的失败状态可以通过查询 `EmailNotificationLog` 发现（`processed_at≠None, sent_at=None`），而路径 B 的失败完全无记录。
 
-### 5.4 项目邀请路径的调用错误
+### 5.4 路径 D：项目邀请 — 调用错误，请求直接 500
 
-[ProjectInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L104-L111) 中存在一个调用名称错误：
+[ProjectInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L104-L111) 存在一个变量名遮蔽（variable shadowing）导致的调用错误。该项目邀请路径与其他业务入口的"静默失败"行为完全不同——请求会在视图层直接崩溃返回 500。
+
+**代码执行流程分析**：
 
 ```python
-# 实际代码（第 105 行）
-project_invitations.delay(
-    invitation.email,
-    project_id,
-    invitation.token,
-    current_site,
-    request.user.email,
+# 第 71 行：project_invitations 是一个 Python list
+project_invitations = []
+
+# 第 72-88 行：向列表追加 ProjectMemberInvite 对象
+for email in emails:
+    project_invitations.append(ProjectMemberInvite(...))
+
+# 第 98-100 行：bulk_create 返回已创建对象的 list，赋给同名变量
+project_invitations = ProjectMemberInvite.objects.bulk_create(
+    project_invitations, batch_size=10, ignore_conflicts=True
 )
+
+# 第 104-111 行：遍历 list，但调用了 list 的 .delay() 方法
+for invitation in project_invitations:
+    project_invitations.delay(        # ← 此处 project_invitations 是 list，不是 Celery task
+        invitation.email,
+        project_id,
+        invitation.token,
+        current_site,
+        request.user.email,
+    )
+
+# 第 113 行：永远不会到达
+return Response({"message": "Email sent successfully"}, status=status.HTTP_200_OK)
 ```
 
-**问题**：
-- 代码调用的是 `project_invitations`（复数），但文件中没有 import 任何名为 `project_invitations` 的对象
-- 对应的 Celery 任务函数名为 [project_invitation](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/bgtasks/project_invitation_task.py#L24)（单数），定义在 `plane.bgtasks.project_invitation_task` 模块中
-- 对比工作区邀请视图，[WorkspaceInvitationsViewset](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/workspace/invite.py#L29) 正确地 import 了 `workspace_invitation` 并调用
+**异常类型**：`AttributeError: 'list' object has no attribute 'delay'`
+
+这不是 `NameError`——`project_invitations` 变量是存在的（第 98 行 `bulk_create` 的返回值，类型为 `list`），但它是一个 Python 列表对象，没有 `.delay()` 方法。而对应的 Celery 任务函数名为 [project_invitation](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/bgtasks/project_invitation_task.py#L24)（单数），既未在文件头部 import，也未被调用。
+
+**对比工作区邀请视图**的写法（正确）：
+
+```python
+# invite.py 第 29 行：import 了 Celery task（单数名）
+from plane.bgtasks.workspace_invitation_task import workspace_invitation
+
+# 第 113-115 行：局部变量是 workspace_invitations（复数），task 是 workspace_invitation（单数）
+workspace_invitations = WorkspaceMemberInvite.objects.bulk_create(...)
+for invitation in workspace_invitations:
+    workspace_invitation.delay(...)   # ← 调用的是 import 的 task，不是 list
+```
+
+工作区邀请视图通过**单复数命名区分**避免了变量遮蔽：`workspace_invitation`（task）vs `workspace_invitations`（list）。项目邀请视图缺少 import，且 `project_invitations` 既是 list 变量名又恰好遮蔽了本应调用的 task 名称。
 
 **后果**：
-- 此代码在运行时会抛出 `NameError: name 'project_invitations' is not defined`，导致项目邀请邮件**永远不会被发送**
-- 由于 `project_invitations.delay(...)` 在 `for invitation in project_invitations:` 循环内，`NameError` 不会被外层 try-except 捕获（视图的 `create()` 方法没有 try-except），会导致整个请求返回 500 错误
-- `ProjectMemberInvite` 记录已在第 98-100 行通过 `bulk_create` 写入 DB，但对应的邮件不会发出，邀请处于"已创建但未通知"的悬挂状态
+1. `bulk_create` 已在第 98-100 行执行，`ProjectMemberInvite` 记录已写入 DB
+2. `for` 循环第一次迭代时，`project_invitations.delay(...)` 抛出 `AttributeError`
+3. 视图的 `create()` 方法没有 try-except，异常直接传播
+4. Django REST Framework 返回 **HTTP 500**，而不是 200
+5. 第 113 行的 `return Response({"message": "Email sent successfully"})` **永远不会到达**
+6. 项目邀请邮件**永远不会被发送**，邀请记录处于"已创建但未通知"的悬挂状态
 
-**修复建议**：在文件头部添加正确的 import，并修正调用名称：
+**修复建议**：在文件头部添加 import，并修正调用名称：
 
 ```python
 from plane.bgtasks.project_invitation_task import project_invitation
@@ -529,8 +562,9 @@ project_invitation.delay(
 | 路径 | 入口 | SMTP 预检 | 失败可观测性 | 用户感知 |
 |------|------|-----------|------------|---------|
 | A: 认证 | 忘记密码 / Magic Link | ✅ 视图层检查 `EMAIL_HOST` | HTTP 400 + 错误码 5025 | 即时看到"SMTP not configured" |
-| B: 业务 | 工作区邀请 / 项目邀请 / 项目添加成员 / 激活 / 停用 | ❌ 无 | 仅 Celery Worker 日志 | 看到"Email sent successfully"但邮件未到 |
+| B: 业务 | 工作区邀请 / 项目添加成员 / 激活 / 停用 | ❌ 无 | 仅 Celery Worker 日志 | 看到"Emails sent successfully"但邮件未到 |
 | C: Issue 通知 | Celery Beat 定时触发 | ❌ 无 | `EmailNotificationLog` 死信 | 无直接感知 |
+| D: 项目邀请 | ProjectInvitationsViewset | ❌ 无 | HTTP 500（`AttributeError`） | 请求直接报错，邮件不可能发出 |
 
 ---
 
@@ -614,11 +648,15 @@ project_invitation.delay(
 
 8. **死信重投递**：`processed_at≠None, sent_at=None` 的记录处于"死信"状态，无自动重投递路径。运维可通过 SQL 将 `processed_at` 重置为 `NULL` 手动重投递（见 4.3 节），但需先确保 SMTP 配置已恢复正常，否则会再次进入死信。
 
-9. **禁用后的静默失败**：禁用邮件后，所有发送任务仍会被触发并执行，只是因 `EMAIL_HOST=""` 导致连接失败后静默返回。Celery Worker 日志中会出现大量 `SMTPConnectError`，但不会影响业务流程（如邀请创建、密码重置请求仍会返回 200）。
+9. **禁用后的失败行为因路径而异**：禁用邮件后，各路径的表现不同：
+    - **路径 A（认证）**：`EMAIL_HOST` 预检拦截，返回 400 + `SMTP_NOT_CONFIGURED`，用户看到明确错误
+    - **路径 B（业务）**：Celery Worker 中因 `SMTPConnectError` 静默失败，HTTP 响应仍返回 200（如 "Emails sent successfully"），用户误以为邮件已发出
+    - **路径 D（项目邀请）**：因 `AttributeError` 在视图层崩溃，直接返回 500
 
-10. **项目邀请邮件当前不可用**：[ProjectInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L105) 调用了不存在的 `project_invitations`（应为 `project_invitation`），导致 `NameError`，项目邀请邮件**在当前代码下永远不会被发送**（详见 5.4 节）。接入邮件网关前需先修复此 bug。
+10. **项目邀请邮件当前不可用**：[ProjectInvitationsViewset.create()](file:///d:/fz/0508-3/solo-dogfeeding/code/198-plane/apps/api/plane/app/views/project/invite.py#L105) 中 `project_invitations` 是 `bulk_create` 返回的列表对象，调用其 `.delay()` 方法会抛出 `AttributeError`，导致请求返回 500，项目邀请邮件**在当前代码下永远不会被发送**（详见 5.4 节）。接入邮件网关前需先修复此 bug。
 
-11. **三条分流路径的运维监控策略不同**：
-    - **路径 A（认证）**：SMTP 未配置时用户会看到明确错误，运维无需额外监控。但若 SMTP 凭据错误（`EMAIL_HOST` 非空但认证失败），预检无法拦截，失败在 Celery Worker 中静默。
+11. **四条分流路径的运维监控策略不同**：
+    - **路径 A（认证）**：SMTP 未配置时用户会看到明确错误（400），运维无需额外监控。但若 SMTP 凭据错误（`EMAIL_HOST` 非空但认证失败），预检无法拦截，失败在 Celery Worker 中静默。
     - **路径 B（业务）**：SMTP 未配置时接口仍返回 200，需在邮件网关侧监控 NDR 退信，或在 Celery Worker 日志中设置 `SMTPConnectError` 告警。
     - **路径 C（Issue 通知）**：可通过定期查询 `EmailNotificationLog` 中 `processed_at≠None AND sent_at=None` 的记录来发现死信。
+    - **路径 D（项目邀请）**：请求直接 500，监控 500 错误即可发现。但需注意修复 bug 前项目邀请功能完全不可用。
