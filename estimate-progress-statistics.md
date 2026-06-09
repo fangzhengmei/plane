@@ -455,13 +455,86 @@ Module 的 "points" 切换下拉只在 `isCurrentEstimateTypeIsPoints`（estimat
 
 ## 七、项目维度 Estimate 汇总
 
-### 7.1 后端汇总接口
+项目维度 analytics 存在 **两套接口链路**：新链路（AdvanceAnalytics，前端实际使用）和旧链路（AnalyticsEndpoint，前端已不调用但后端仍可用）。
 
-项目维度有两个 analytics 接口：
+### 7.1 新接口链路：AdvanceAnalytics + build_analytics_chart（前端实际调用路径）
 
-#### 7.1.1 AnalyticsEndpoint（通用图表）
+#### 7.1.1 前端调用链
 
-`apps/api/plane/app/views/analytic/base.py#L37-L173`：workspace 级别，支持通过 `project` 筛选参数聚焦到单个项目。
+```
+CustomizedInsights 组件（analytics/work-items/customized-insights.tsx）
+  → AnalyticsSelectParams 选择 x_axis / y_axis / group_by
+  → PriorityChart 组件（analytics/work-items/priority-chart.tsx）
+  → AnalyticsService.getAdvanceAnalyticsCharts(workspaceSlug, "custom-work-items", params)
+  → GET /api/workspaces/{slug}/advance-analytics-charts?type=custom-work-items&x_axis=...&group_by=...
+```
+
+前端 `CustomizedInsights`（`apps/web/core/components/analytics/work-items/customized-insights.tsx#L29-L34`）通过 `useForm` 初始化参数：
+
+```ts
+defaultValues: {
+  x_axis: ChartXAxisProperty.PRIORITY,
+  y_axis: isEpic ? ChartYAxisMetric.EPIC_WORK_ITEM_COUNT : ChartYAxisMetric.WORK_ITEM_COUNT,
+},
+```
+
+用户可通过 `AnalyticsSelectParams` 选择 x_axis 和 group_by，但 y_axis 始终为 `WORK_ITEM_COUNT` 或 `EPIC_WORK_ITEM_COUNT`（`ESTIMATE_POINT_COUNT` 被 `hiddenOptions` 隐藏，见 7.3.1）。
+
+`PriorityChart`（`apps/web/core/components/analytics/work-items/priority-chart.tsx#L63-L80`）将 `props`（含 `x_axis`、`y_axis`、`group_by`）传给 `getAdvanceAnalyticsCharts`，但后端 `custom-work-items` 分支只使用 `x_axis` 和 `group_by`，**不使用 `y_axis`**。
+
+#### 7.1.2 后端处理
+
+`AdvanceAnalyticsChartEndpoint.get`（`apps/api/plane/app/views/analytic/advance.py#L286-L310`）对 `type="custom-work-items"` 的处理：
+
+```python
+elif type == "custom-work-items":
+    queryset = (
+        Issue.issue_objects.filter(**self.filters["base_filters"])
+        .select_related("workspace", "state", "parent")
+        .prefetch_related("assignees", "labels", "issue_module__module", "issue_cycle__cycle")
+    )
+    if self.filters["chart_period_range"]:
+        start_date, end_date = self.filters["chart_period_range"]
+        queryset = queryset.filter(created_at__date__gte=start_date, created_at__date__lte=end_date)
+    return Response(build_analytics_chart(queryset, x_axis, group_by))
+```
+
+**关键**：只传 `x_axis` 和 `group_by`，**没有 `y_axis` 参数**。`y_axis` 从请求 GET 参数中读取后未传入 `build_analytics_chart`。
+
+#### 7.1.3 build_analytics_chart 只做 Count
+
+`build_analytics_chart`（`apps/api/plane/utils/build_chart.py#L153-L194`）：
+
+```python
+def build_analytics_chart(queryset, x_axis, group_by=None, date_filter=None):
+    aggregate_func = Count("id", distinct=True)  # 硬编码 Count，不使用 y_axis
+    ...
+    if group_field:
+        response, schema = build_grouped_chart_response(queryset, id_field, name_field, group_field, group_name_field, aggregate_func)
+    else:
+        response = build_simple_chart_response(queryset, id_field, name_field, aggregate_func)
+    return {"data": response, "schema": schema}
+```
+
+**核心结论**：`build_analytics_chart` **只做 `Count("id", distinct=True)`**，不支持 `y_axis`，不做 estimate 汇总。无论项目使用哪种 estimate 类型，图表始终按 x_axis 分组计数 issue 数量。
+
+x_axis 支持 `ESTIMATE_POINTS`（`apps/api/plane/utils/build_chart.py#L58`），映射到 `estimate_point__key` / `estimate_point__value`，可以将 estimate point 值作为 X 轴分组维度，但 Y 轴值仍然是 Count（issue 数量），不是 estimate 点数之和。
+
+`get_y_axis_filter`（`apps/api/plane/utils/build_chart.py#L37-L41`）只支持 `WORK_ITEM_COUNT`：
+
+```python
+def get_y_axis_filter(y_axis: str) -> Dict[str, Any]:
+    filter_mapping = {"WORK_ITEM_COUNT": {"id": F("id")}}
+    return filter_mapping.get(y_axis, {})
+```
+
+该函数存在但未被 `build_analytics_chart` 调用——是遗留代码。
+
+### 7.2 旧接口链路：AnalyticsEndpoint + build_graph_plot（前端已不调用，仅可绕过 UI 直接调 API）
+
+#### 7.2.1 后端接口
+
+`AnalyticsEndpoint`（`apps/api/plane/app/views/analytic/base.py#L37-L173`）：workspace 级别，支持通过 `project` 筛选参数聚焦到单个项目。
 
 ```python
 class AnalyticsEndpoint(BaseAPIView):
@@ -480,9 +553,11 @@ class AnalyticsEndpoint(BaseAPIView):
 queryset = queryset.annotate(estimate=Sum(Cast("estimate_point__value", FloatField())))
 ```
 
-这里 **没有** `estimate_point__estimate__type="points"` 过滤，也 **没有** `estimate_point__isnull=False` 过滤。所有 issue 都参与聚合，没有 estimate_point 的 issue 通过 FK LEFT JOIN 后 `estimate_point__value` 为 null，`Cast(null AS double precision)` 返回 null，`Sum` 忽略 null——这部分正常。**但 CATEGORIES 类型会触发 PostgreSQL 错误**：Django 的 `Cast("estimate_point__value", FloatField())` 生成 SQL `CAST(estimate_point_value AS DOUBLE PRECISION)`。PostgreSQL 对非数字字符串（如 "XS"、"S"、"M"）执行 CAST 时会抛出错误码 22P02（`invalid input syntax for type double precision`），**不会静默返回 null**。因此，如果项目使用 CATEGORIES 类型 estimate 且前端绕过守卫发送了 `y_axis=estimate` 请求，后端会返回 500 错误。TIME 类型的 value 是数字字符串（如 "1"、"60"），`CAST` 可以正常转为 float，不会报错。
+这里 **没有** `estimate_point__estimate__type="points"` 过滤，也 **没有** `estimate_point__isnull=False` 过滤。没有 estimate_point 的 issue 通过 FK LEFT JOIN 后 `estimate_point__value` 为 null，`Cast(null AS double precision)` 返回 null，`Sum` 忽略 null——这部分正常。**但 CATEGORIES 类型会触发 PostgreSQL 错误**：Django 的 `Cast("estimate_point__value", FloatField())` 生成 SQL `CAST(estimate_point_value AS DOUBLE PRECISION)`。PostgreSQL 对非数字字符串（如 "XS"、"S"、"M"）执行 CAST 时会抛出错误码 22P02（`invalid input syntax for type double precision`），**不会静默返回 null**。因此，如果项目使用 CATEGORIES 类型 estimate 且直接调 API 发送 `y_axis=estimate` 请求，后端会返回 500 错误。TIME 类型的 value 是数字字符串（如 "1"、"60"），`CAST` 可以正常转为 float，不会报错。
 
-#### 7.1.2 DefaultAnalyticsEndpoint（默认统计面板）
+**此接口前端已不调用**。`AnalyticsEndpoint` 和 `build_graph_plot` 属于旧版 analytics 体系，前端当前使用的自定义图表走 `AdvanceAnalyticsChartEndpoint` + `build_analytics_chart`（仅 Count）。`y_axis=estimate` 的风险仅在直接调 API 绕过 UI 时存在。
+
+#### 7.2.2 DefaultAnalyticsEndpoint（旧版统计面板）
 
 `apps/api/plane/app/views/analytic/base.py#L251-L388`：
 
@@ -493,32 +568,30 @@ total_estimate_sum = base_issues.aggregate(sum=Sum("point"))["sum"]
 
 **重要**：这里使用的是 **旧版 `point` 字段**（IntegerField），而不是 `estimate_point`（FK）。这是一个独立的、已废弃的统计口径，与当前 estimate 系统完全无关。
 
-#### 7.1.3 ProjectStatsEndpoint
+#### 7.2.3 ProjectStatsEndpoint
 
 `apps/api/plane/app/views/analytic/base.py#L391-L455`：只统计 issue 数量和成员数，不涉及 estimate。
 
-### 7.2 前端筛选与图表展示流程
+### 7.3 前端筛选与 y_axis=estimate 可达性分析
 
-1. **Y 轴指标筛选**：`apps/web/core/components/analytics/select/select-y-axis.tsx` 提供选项列表 `ANALYTICS_Y_AXIS_VALUES`（定义在 `packages/constants/src/analytics/common.ts#L175-L188`），包含三个值：`WORK_ITEM_COUNT`（"Work item"）、`ESTIMATE_POINT_COUNT`（"Estimate"）、`EPIC_WORK_ITEM_COUNT`（"Epic"）。
+#### 7.3.1 新接口链路的前端筛选
 
-   其中 `ESTIMATE_POINT_COUNT` 通过 `hiddenOptions` 默认隐藏（`apps/web/core/components/analytics/select/analytics-params.tsx#L56`）：
+`AnalyticsSelectParams`（`apps/web/core/components/analytics/select/analytics-params.tsx#L56`）通过 `hiddenOptions` 始终隐藏 `ESTIMATE_POINT_COUNT`：
 
-   ```ts
-   hiddenOptions={[
-     ChartYAxisMetric.ESTIMATE_POINT_COUNT,
-     isEpic ? ChartYAxisMetric.WORK_ITEM_COUNT : ChartYAxisMetric.EPIC_WORK_ITEM_COUNT,
-   ]}
-   ```
+```ts
+hiddenOptions={[
+  ChartYAxisMetric.ESTIMATE_POINT_COUNT,
+  isEpic ? ChartYAxisMetric.WORK_ITEM_COUNT : ChartYAxisMetric.EPIC_WORK_ITEM_COUNT,
+]}
+```
 
-   `isEstimateEnabled` 守卫逻辑（`apps/web/core/components/analytics/select/select-y-axis.tsx#L29-L44`）检查的是 `analyticsOption === "estimate"`，但实际传入的 option.value 是 `ChartYAxisMetric.ESTIMATE_POINT_COUNT`（即 `"ESTIMATE_POINT_COUNT"`），而非字符串 `"estimate"`。因此 `isEstimateEnabled("ESTIMATE_POINT_COUNT")` 中 `analyticsOption === "estimate"` **永远为 false**，该函数始终返回 `true`——**守卫条件形同虚设**。
+`isEstimateEnabled` 守卫逻辑（`apps/web/core/components/analytics/select/select-y-axis.tsx#L29-L44`）检查 `analyticsOption === "estimate"`，但实际传入的 option.value 是 `ChartYAxisMetric.ESTIMATE_POINT_COUNT`（即 `"ESTIMATE_POINT_COUNT"`），与 `"estimate"` 永远不匹配，守卫始终返回 `true`——**守卫条件形同虚设**。实际隐藏 Estimate 选项的是 `hiddenOptions` 参数。
 
-   实际隐藏 `ESTIMATE_POINT_COUNT` 选项的是 `hiddenOptions` 参数，而非 `isEstimateEnabled` 守卫。这意味着在当前代码中，**Estimate 选项始终被隐藏**，不管项目是否启用了 POINTS 类型 estimate。用户在正常 UI 流程中无法选择 Estimate 作为 Y 轴。
+**结论**：在新接口链路中，Estimate Y 轴选项始终被隐藏，用户无法选择。即使选择了，后端 `build_analytics_chart` 也不支持 y_axis，始终只做 Count。
 
-2. **后端请求**：`AnalyticsEndpoint` 通过 `x_axis`、`y_axis`、`segment` 参数控制图表维度。`VALID_YAXIS = ["issue_count", "estimate"]`（`apps/api/plane/utils/analytics_plot.py#L40`），后端接受 `"estimate"` 作为 y_axis 值。但前端传给后端的 y_axis 值来自 `ChartYAxisMetric` 枚举（如 `"WORK_ITEM_COUNT"`），与后端 `VALID_YAXIS` 的 `"issue_count"` / `"estimate"` 值域不同——需注意前端和后端之间存在值映射层。
+#### 7.3.2 旧接口链路的可达性
 
-3. **数据渲染**：后端返回的 `distribution` 是按 x_axis 分组的聚合结果，前端用柱状图或折线图展示。
-
-### 7.3 项目维度 analytics 中 y_axis=estimate 的实际可达路径
+旧接口 `AnalyticsEndpoint` + `build_graph_plot` 支持 `y_axis="estimate"`，且后端 `VALID_YAXIS = ["issue_count", "estimate"]`（`apps/api/plane/utils/analytics_plot.py#L40`）。但前端不再调用此接口，`y_axis=estimate` 仅可通过直接调 API 触发。
 
 `build_graph_plot` 在 `y_axis="estimate"` 时的行为取决于项目 estimate 类型：
 
@@ -529,14 +602,16 @@ total_estimate_sum = base_issues.aggregate(sum=Sum("point"))["sum"]
 | CATEGORIES | **PostgreSQL 报错（22P02）** | value 如 "XS" 无法 CAST 为 DOUBLE PRECISION |
 | 无 estimate | 每个 x_axis 分组的 estimate 值为 null | estimate_point 为 null，Cast(null) = null，Sum 忽略 |
 
-**但正常 UI 流程中，y_axis=estimate 不可达**：前端 `ESTIMATE_POINT_COUNT` 通过 `hiddenOptions` 始终隐藏，用户无法选择 Estimate 作为 Y 轴。`isEstimateEnabled` 守卫因字符串不匹配而失效，但 `hiddenOptions` 作为事实上的防护确保了正常使用不会触发问题。
+### 7.4 两套接口链路对比
 
-**如果直接调用 API 发送 `y_axis=estimate`**：
-- POINTS 项目：正常工作
-- TIME 项目：正常工作，但数据含义不同（value 为分钟数而非点数）
-- CATEGORIES 项目：500 错误（PostgreSQL CAST 失败）
-
-与 Cycle/Module 维度的差异：Cycle/Module 的 estimate 汇总硬编码了 `estimate_point__estimate__type="points"` 过滤，非 POINTS 项目的 estimate_points 为 0 但不会报错。`build_graph_plot` 无此过滤，在 CATEGORIES 项目上直接报错。
+| 对比项 | 新链路（AdvanceAnalytics + build_analytics_chart） | 旧链路（AnalyticsEndpoint + build_graph_plot） |
+|--------|--------------------------------------------------|----------------------------------------------|
+| 前端是否调用 | **是**，CustomizedInsights → PriorityChart | **否**，已废弃 |
+| y_axis 支持 | **不支持**，硬编码 `Count("id")` | 支持 `issue_count` 和 `estimate` |
+| estimate 汇总 | **不支持** | 支持（`Sum(Cast("estimate_point__value", FloatField()))`） |
+| x_axis 支持 ESTIMATE_POINTS | 是（按 estimate_point 分组计数） | 是（同） |
+| CATEGORIES 项目安全性 | **安全**（只做 Count，不涉及 CAST） | 不安全（CAST 非数字值会 500） |
+| estimate type 过滤 | 不适用（不做 estimate 汇总） | **无**（无 `estimate__type="points"` 过滤） |
 
 ---
 
